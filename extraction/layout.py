@@ -63,12 +63,14 @@ def _downsample(gray: np.ndarray, width: int = DOWNSAMPLE_WIDTH) -> tuple[np.nda
     return np.asarray(im), scale
 
 
-def _find_log_section(dark: np.ndarray) -> tuple[int, int]:
-    """Rows belonging to the gridded log section.
+def _find_log_sections(dark: np.ndarray, min_rows: int = 300,
+                       merge_gap: int = 15) -> list[tuple[int, int]]:
+    """Row ranges of candidate log sections (a strip may hold several).
 
     The log grid produces rows with many dark pixels at regular intervals.
-    Headers/footers have irregular, sparser rows. We take the longest run of
-    rows whose local dark density stays above a floor.
+    Headers/footers have irregular, sparser rows. Composite strips contain
+    several gridded sections separated by header inserts, so we return every
+    long-enough run of active rows, merging runs split by small gaps.
     """
     row_frac = dark.mean(axis=1)
     # smooth over ~50 rows to bridge white gaps between grid lines
@@ -76,16 +78,23 @@ def _find_log_section(dark: np.ndarray) -> tuple[int, int]:
     smooth = np.convolve(row_frac, kernel, mode="same")
     active = smooth > max(0.02, np.percentile(smooth, 40) * 0.5)
 
-    # longest contiguous run of active rows
-    best_len, best_start, run_start = 0, 0, None
+    runs, run_start = [], None
     for i, a in enumerate(np.append(active, False)):
         if a and run_start is None:
             run_start = i
         elif not a and run_start is not None:
-            if i - run_start > best_len:
-                best_len, best_start = i - run_start, run_start
+            runs.append([run_start, i])
             run_start = None
-    return best_start, best_start + best_len
+
+    # merge runs separated by small gaps (fold lines, insert stickers)
+    merged: list[list[int]] = []
+    for r in runs:
+        if merged and r[0] - merged[-1][1] <= merge_gap:
+            merged[-1][1] = r[1]
+        else:
+            merged.append(r)
+
+    return [(a, b) for a, b in merged if b - a >= min_rows]
 
 
 def _slab_line_centers(slab: np.ndarray) -> list[int]:
@@ -125,13 +134,15 @@ def _find_track_borders(dark: np.ndarray, log_top: int, log_bottom: int,
     if n_slabs_used == 0:
         return []
 
-    # chain line centers across consecutive slabs
-    chains: list[list[int]] = []       # x positions per chain
-    active: list[tuple[int, int]] = [] # (chain_idx, last_x)
+    # chain line centers across consecutive slabs; a chain survives a couple
+    # of missed slabs (folds, tape, degraded ink briefly break a border)
+    max_misses = 2
+    chains: list[list[int]] = []            # x positions per chain
+    active: list[list[int]] = []            # [chain_idx, last_x, misses]
     for centers in slab_centers:
         new_active = []
         unmatched = list(centers)
-        for chain_idx, last_x in active:
+        for chain_idx, last_x, misses in active:
             best, best_d = None, match_px + 1
             for x in unmatched:
                 d = abs(x - last_x)
@@ -140,13 +151,15 @@ def _find_track_borders(dark: np.ndarray, log_top: int, log_bottom: int,
             if best is not None:
                 unmatched.remove(best)
                 chains[chain_idx].append(best)
-                new_active.append((chain_idx, best))
+                new_active.append([chain_idx, best, 0])
+            elif misses < max_misses:
+                new_active.append([chain_idx, last_x, misses + 1])
         for x in unmatched:
             chains.append([x])
-            new_active.append((len(chains) - 1, x))
+            new_active.append([len(chains) - 1, x, 0])
         active = new_active
 
-    borders = [int(np.median(c)) for c in chains if len(c) >= 0.7 * n_slabs_used]
+    borders = [int(np.median(c)) for c in chains if len(c) >= 0.6 * n_slabs_used]
     return sorted(borders)
 
 
@@ -179,31 +192,53 @@ def _find_depth_column(dark: np.ndarray, log_top: int, log_bottom: int,
     return None
 
 
-def detect_layout(path: str) -> Layout:
-    gray = load_gray(path)
-
-    # log-section rows: coarse structure, downsampled analysis is fine.
-    # NOTE: downsampling averages thin black lines into light gray, so
-    # anything that depends on 1-3 px lines must use the FULL-RES mask.
-    small, scale = _downsample(gray)
-    dark_small = (small < DARK_THRESHOLD).astype(np.float32)
-    top_s, bottom_s = _find_log_section(dark_small)
-    log_top, log_bottom = int(top_s / scale), int(bottom_s / scale)
-
-    # borders & depth column: full-resolution binary mask
-    dark = (gray < DARK_THRESHOLD).astype(np.float32)
+def _analyze_section(dark: np.ndarray, log_top: int, log_bottom: int,
+                     width: int) -> tuple[list[int], tuple | None, list]:
     borders = _find_track_borders(dark, log_top, log_bottom)
     depth_col = _find_depth_column(dark, log_top, log_bottom, borders)
 
     # tracks = bands between consecutive borders, excluding the depth column
     tracks = []
-    min_track_w = 0.08 * gray.shape[1]
+    min_track_w = 0.08 * width
     for left, right in zip(borders, borders[1:]):
         if depth_col is not None and (left, right) == depth_col:
             continue
         if right - left >= min_track_w:
             tracks.append((left, right))
+    return borders, depth_col, tracks
 
+
+def detect_layout(path: str) -> Layout:
+    gray = load_gray(path)
+
+    # section rows: coarse structure, downsampled analysis is fine.
+    # NOTE: downsampling averages thin black lines into light gray, so
+    # anything that depends on 1-3 px lines must use the FULL-RES mask.
+    small, scale = _downsample(gray)
+    dark_small = (small < DARK_THRESHOLD).astype(np.float32)
+    sections = _find_log_sections(dark_small)
+
+    # borders & depth column: full-resolution binary mask.
+    # A strip may hold several log sections (main log, repeat section);
+    # analyze each and keep the best-scoring one as the primary layout.
+    dark = (gray < DARK_THRESHOLD).astype(np.float32)
+
+    best = None
+    for top_s, bottom_s in sections:
+        log_top, log_bottom = int(top_s / scale), int(bottom_s / scale)
+        borders, depth_col, tracks = _analyze_section(
+            dark, log_top, log_bottom, gray.shape[1])
+        # depth column is the strongest signal a section is a real log
+        score = (10 if depth_col else 0) + len(tracks) \
+            + 0.000001 * (log_bottom - log_top)
+        if best is None or score > best[0]:
+            best = (score, log_top, log_bottom, borders, depth_col, tracks)
+
+    if best is None:
+        h = gray.shape[0]
+        best = (0, 0, h, [], None, [])
+
+    _, log_top, log_bottom, borders, depth_col, tracks = best
     return Layout(
         width=gray.shape[1],
         height=gray.shape[0],
