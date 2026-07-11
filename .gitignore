@@ -1,0 +1,11 @@
+# local data — never commit well data files
+data/
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+*.egg-info/
+.DS_Store
+Thumbs.db
