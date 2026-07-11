@@ -1,13 +1,16 @@
-"""Download paired scan (TIFF) + LAS files listed in the manifest.
+"""Download matched scan (TIFF) + LAS pairs from data/matched_pairs.csv.
 
 Each downloaded pair lands in data/pairs/<API_NUM_NODASH>/:
 
     <API>/
         scan_<id>.tif      the scanned paper log image
-        las_<id>.las       the well's digital LAS file(s)  (ground truth)
+        las_<id>.las       the LAS file covering the same depth interval
+                           (ground truth)
+
+Run pipeline.indexes then pipeline.pairs first.
 
 Usage:
-    python -m pipeline.download --limit 20      # grab 20 pairs to start
+    python -m pipeline.download --limit 100
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from tqdm import tqdm
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MANIFEST = DATA_DIR / "manifest_pairs.csv"
+MATCHED = DATA_DIR / "matched_pairs.csv"
 PAIRS_DIR = DATA_DIR / "pairs"
 
 TIMEOUT = 60
@@ -46,15 +50,17 @@ def _download(url: str, dest: Path) -> bool:
         return False
 
 
-def download_pairs(limit: int = 20, manifest_path: Path = MANIFEST) -> None:
-    df = pd.read_csv(manifest_path, dtype=str)
+def download_pairs(limit: int = 20, pairs_path: Path = MATCHED) -> None:
+    """Download matched (scan, LAS) pairs produced by pipeline.pairs."""
+    df = pd.read_csv(pairs_path)
+    df = df[df["GOOD_PAIR"]]
 
     # one scan row per well first, so a small --limit spans many wells
     wells = df.drop_duplicates("API_NUM_NODASH").head(limit)
 
     ok_scans = ok_las = 0
-    for _, row in tqdm(wells.iterrows(), total=len(wells), desc="wells"):
-        well_dir = PAIRS_DIR / row["API_NUM_NODASH"]
+    for _, row in tqdm(wells.iterrows(), total=len(wells), desc="pairs"):
+        well_dir = PAIRS_DIR / str(row["API_NUM_NODASH"])
         well_dir.mkdir(parents=True, exist_ok=True)
 
         scan_name = row["SCAN_URL"].rstrip("/").rsplit("/", 1)[-1]
@@ -68,15 +74,12 @@ def download_pairs(limit: int = 20, manifest_path: Path = MANIFEST) -> None:
         if any(_download(url, dest) for url in candidates):
             ok_scans += 1
 
-        for entry in str(row["LAS_FILES"]).split(";"):
-            url = entry.split("|", 1)[0]
-            if not url:
-                continue
-            las_name = url.rstrip("/").rsplit("/", 1)[-1]
-            if _download(url, well_dir / f"las_{las_name}"):
-                ok_las += 1
+        las_url = row["LAS_URL"]
+        las_name = las_url.rstrip("/").rsplit("/", 1)[-1]
+        if _download(las_url, well_dir / f"las_{las_name}"):
+            ok_las += 1
 
-    print(f"downloaded: {ok_scans}/{len(wells)} scans, {ok_las} LAS files -> {PAIRS_DIR}")
+    print(f"downloaded: {ok_scans}/{len(wells)} scans, {ok_las}/{len(wells)} LAS files -> {PAIRS_DIR}")
 
 
 if __name__ == "__main__":
