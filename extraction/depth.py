@@ -50,45 +50,61 @@ class DepthCalibration:
         return (depth - self.intercept) / self.slope
 
 
-def _find_label_blobs(band: np.ndarray, min_h: int = 15, max_h: int = 120,
-                      pad: int = 8) -> list[tuple[int, int]]:
-    """Row ranges of candidate depth-label blobs inside the depth column.
+def _parse_label(text: str) -> int | None:
+    """Parse an OCR'd string as a depth label, or None if it isn't one."""
+    text = text.replace(",", "").replace(" ", "")
+    if not text.isdigit() or not 2 <= len(text) <= 5:
+        return None
+    value = int(text)
+    # depth labels are round numbers; anything else is an OCR misread or a
+    # stray mark (grid digits, specks) and poisons the fit
+    if value < 50 or value % 25 != 0:
+        return None
+    return value
 
-    The column is white except for the printed numbers, so blobs are runs of
-    rows containing ink.
+
+def _ocr_depth_labels(band: np.ndarray, dpi: float,
+                      min_conf: float = 0.3) -> list[tuple[float, float]]:
+    """OCR all depth labels in the depth-column band.
+
+    Runs easyocr's own text detector over the band in overlapping segments
+    (the band can be 80k+ rows tall). Its detector copes with commas,
+    borders and varied print far better than a hand-rolled blob finder.
+    Returns (row_in_band, depth) points.
     """
-    dark = band < DARK_THRESHOLD
-    row_has_ink = dark.mean(axis=1) > 0.02
+    # upscale narrow/low-dpi bands so digits reach a size easyocr likes
+    upscale = max(1.0, 120.0 / max(1.0, 0.12 * dpi))
+    # easyocr shrinks images whose long side exceeds its canvas (~2560 px),
+    # which destroys the digits; keep each segment under that AFTER upscaling
+    seg_h = int(2300 / upscale)
+    overlap = 200
 
-    blobs, start = [], None
-    for i, a in enumerate(np.append(row_has_ink, False)):
-        if a and start is None:
-            start = i
-        elif not a and start is not None:
-            h = i - start
-            if min_h <= h <= max_h:
-                blobs.append((max(0, start - pad), min(band.shape[0], i + pad)))
-            start = None
-    return blobs
-
-
-def _ocr_blob(band: np.ndarray, top: int, bottom: int) -> int | None:
-    """OCR one label blob; returns the depth number or None."""
-    crop = band[top:bottom]
-    # upscale small crops for better OCR
-    im = Image.fromarray(crop)
-    scale = max(1, int(60 / max(1, im.height)))
-    if scale > 1:
-        im = im.resize((im.width * scale, im.height * scale), Image.LANCZOS)
-    result = _reader().readtext(np.asarray(im), allowlist="0123456789",
-                                detail=1, paragraph=False)
-    if not result:
-        return None
-    # take the highest-confidence reading
-    _, text, conf = max(result, key=lambda r: r[2])
-    if conf < 0.4 or not text.isdigit() or not 1 <= len(text) <= 5:
-        return None
-    return int(text)
+    points = []
+    for seg_top in range(0, band.shape[0], seg_h - overlap):
+        seg = band[seg_top:seg_top + seg_h]
+        if seg.size == 0 or (seg < DARK_THRESHOLD).mean() < 0.0005:
+            continue  # blank segment, nothing to read
+        im = Image.fromarray(seg)
+        if upscale > 1.0:
+            im = im.resize((int(im.width * upscale), int(im.height * upscale)),
+                           Image.LANCZOS)
+        # depth labels are often printed rotated 90 degrees along the strip;
+        # rotation_info makes easyocr try those orientations per text box
+        for box, text, conf in _reader().readtext(
+                np.asarray(im), allowlist="0123456789,", detail=1,
+                paragraph=False, rotation_info=[90, 270]):
+            if conf < min_conf:
+                continue
+            value = _parse_label(text)
+            if value is None:
+                continue
+            y_center = sum(p[1] for p in box) / len(box) / upscale
+            row = seg_top + y_center
+            # de-duplicate labels found twice in overlapping segments
+            if any(abs(row - r) < 20 and value == d for r, d in points):
+                continue
+            points.append((row, float(value)))
+    return points
 
 
 def _consensus_fit(points: list[tuple[float, float]]) -> tuple[float, float, list]:
@@ -133,18 +149,20 @@ def calibrate_depth(path: str, layout: Layout) -> DepthCalibration:
     left, right = layout.depth_col
     band = gray[layout.log_top:layout.log_bottom, left + 3:right - 2]
 
-    blobs = _find_label_blobs(band)
-    points = []
-    for top, bottom in blobs:
-        value = _ocr_blob(band, top, bottom)
-        if value is not None:
-            row_center = layout.log_top + (top + bottom) / 2
-            points.append((row_center, float(value)))
+    dpi = layout.width / 8.25
+    points = [(layout.log_top + row, depth)
+              for row, depth in _ocr_depth_labels(band, dpi)]
 
     if len(points) < 3:
         raise ValueError(f"only {len(points)} depth labels OCR'd")
 
     slope, intercept, inliers = _consensus_fit(points)
+
+    # physical sanity: on a scan, depth increases downward and log scales
+    # run ~1:120 to 1:1200, i.e. roughly 4-120 ft of depth per inch of paper
+    ft_per_inch = slope * dpi
+    if not (4.0 <= ft_per_inch <= 120.0):
+        raise ValueError(f"implausible scale: {ft_per_inch:.1f} ft/inch")
 
     rows = np.array([r for r, _ in inliers])
     depths = np.array([d for _, d in inliers])

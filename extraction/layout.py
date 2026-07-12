@@ -163,31 +163,51 @@ def _find_track_borders(dark: np.ndarray, log_top: int, log_bottom: int,
     return sorted(borders)
 
 
+def _digit_blob_count(interior: np.ndarray, dpi: float) -> int:
+    """Number of digit-sized ink blobs in a band (depth-label candidates)."""
+    ink_rows = interior.mean(axis=1) > 0.02
+    # max_h allows labels printed rotated 90 deg (a vertical "3400" is one
+    # tall blob spanning several digit heights)
+    min_h, max_h = int(0.04 * dpi), int(0.70 * dpi)
+    count, start = 0, None
+    for i, a in enumerate(np.append(ink_rows, False)):
+        if a and start is None:
+            start = i
+        elif not a and start is not None:
+            if min_h <= i - start <= max_h:
+                count += 1
+            start = None
+    return count
+
+
 def _find_depth_column(dark: np.ndarray, log_top: int, log_bottom: int,
                        borders: list[int]) -> tuple[int, int] | None:
-    """Among bands between borders, pick the mostly-white one (depth column).
+    """Among bands between borders, pick the depth column.
 
-    The depth column has no grid: its interior dark fraction is far lower
-    than curve tracks. Require a plausible width (2-15% of image width).
+    A depth column is (a) mostly white — no grid inside — and (b) contains
+    digit-sized ink blobs: the printed depth labels. Requiring the blobs is
+    what separates it from empty gutters on non-standard layouts.
     """
     if len(borders) < 2:
         return None
     w = dark.shape[1]
     section = dark[log_top:log_bottom]
+    dpi = w / 8.25  # log strips are ~8.25 in wide; fine as a rough scale
 
-    best, best_score = None, 1.0
+    best, best_blobs = None, 0
     for left, right in zip(borders, borders[1:]):
         band_w = right - left
         if not (0.02 * w <= band_w <= 0.15 * w):
             continue
         interior = section[:, left + 2:right - 1]
-        if interior.size == 0:
-            continue
-        score = interior.mean()
-        if score < best_score:
-            best, best_score = (left, right), score
-    # a real depth column is nearly white (few % ink from the numbers)
-    if best is not None and best_score < 0.08:
+        if interior.size == 0 or interior.mean() > 0.10:
+            continue  # gridded/curve band, not a depth column
+        blobs = _digit_blob_count(interior, dpi)
+        if blobs > best_blobs:
+            best, best_blobs = (left, right), blobs
+
+    # demand a handful of labels; one or two blobs is just specks/noise
+    if best is not None and best_blobs >= 4:
         return best
     return None
 
