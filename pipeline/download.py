@@ -50,8 +50,36 @@ def _download(url: str, dest: Path) -> bool:
         return False
 
 
-def download_pairs(limit: int = 20, pairs_path: Path = MATCHED) -> None:
-    """Download matched (scan, LAS) pairs produced by pipeline.pairs."""
+def _fetch_well(row) -> tuple[bool, bool]:
+    """Download one well's scan + LAS; returns (scan_ok, las_ok)."""
+    well_dir = PAIRS_DIR / str(row["API_NUM_NODASH"])
+    well_dir.mkdir(parents=True, exist_ok=True)
+
+    scan_name = row["SCAN_URL"].rstrip("/").rsplit("/", 1)[-1]
+    dest = well_dir / f"scan_{scan_name}"
+    # Azure blob names are case-sensitive and extension case varies (.tif/.TIF),
+    # so try the rewritten URL, the original KGS URL, and both extension cases.
+    candidates = []
+    for url in (row["SCAN_URL"], row.get("SCAN_URL_ORIG")):
+        if isinstance(url, str) and url:
+            candidates += [url, _swap_ext_case(url)]
+    scan_ok = any(_download(url, dest) for url in candidates)
+
+    las_url = row["LAS_URL"]
+    las_name = las_url.rstrip("/").rsplit("/", 1)[-1]
+    las_ok = _download(las_url, well_dir / f"las_{las_name}")
+    return scan_ok, las_ok
+
+
+def download_pairs(limit: int = 20, pairs_path: Path = MATCHED,
+                   workers: int = 8) -> None:
+    """Download matched (scan, LAS) pairs produced by pipeline.pairs.
+
+    Network-bound, so a thread pool gives near-linear speedup. Existing
+    files are skipped, making the whole run resumable.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
     df = pd.read_csv(pairs_path)
     df = df[df["GOOD_PAIR"]]
 
@@ -59,25 +87,12 @@ def download_pairs(limit: int = 20, pairs_path: Path = MATCHED) -> None:
     wells = df.drop_duplicates("API_NUM_NODASH").head(limit)
 
     ok_scans = ok_las = 0
-    for _, row in tqdm(wells.iterrows(), total=len(wells), desc="pairs"):
-        well_dir = PAIRS_DIR / str(row["API_NUM_NODASH"])
-        well_dir.mkdir(parents=True, exist_ok=True)
-
-        scan_name = row["SCAN_URL"].rstrip("/").rsplit("/", 1)[-1]
-        dest = well_dir / f"scan_{scan_name}"
-        # Azure blob names are case-sensitive and extension case varies (.tif/.TIF),
-        # so try the rewritten URL, the original KGS URL, and both extension cases.
-        candidates = []
-        for url in (row["SCAN_URL"], row.get("SCAN_URL_ORIG")):
-            if isinstance(url, str) and url:
-                candidates += [url, _swap_ext_case(url)]
-        if any(_download(url, dest) for url in candidates):
-            ok_scans += 1
-
-        las_url = row["LAS_URL"]
-        las_name = las_url.rstrip("/").rsplit("/", 1)[-1]
-        if _download(las_url, well_dir / f"las_{las_name}"):
-            ok_las += 1
+    rows = [row for _, row in wells.iterrows()]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for scan_ok, las_ok in tqdm(pool.map(_fetch_well, rows),
+                                    total=len(rows), desc="pairs"):
+            ok_scans += scan_ok
+            ok_las += las_ok
 
     print(f"downloaded: {ok_scans}/{len(wells)} scans, {ok_las}/{len(wells)} LAS files -> {PAIRS_DIR}")
 
@@ -85,5 +100,6 @@ def download_pairs(limit: int = 20, pairs_path: Path = MATCHED) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=20, help="number of wells to download")
+    parser.add_argument("--workers", type=int, default=8, help="parallel downloads")
     args = parser.parse_args()
-    download_pairs(limit=args.limit)
+    download_pairs(limit=args.limit, workers=args.workers)

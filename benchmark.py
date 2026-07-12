@@ -9,7 +9,10 @@ For every downloaded pair:
 Output: data/benchmark.csv with one row per traced curve.
 
 Usage:
-    python benchmark.py
+    python benchmark.py [--workers 3]
+
+Workers are separate processes, each with its own OCR model (~1 GB VRAM);
+3 workers fit an 8 GB GPU comfortably.
 """
 
 from __future__ import annotations
@@ -55,73 +58,92 @@ COLUMNS = ["well", "stage", "error", "track", "curve", "trace_std",
            "match", "r", "lag_ft", "rms_ft"]
 
 
-def run(pairs_dir: str = "data/pairs", out_csv: str = "data/benchmark.csv"):
-    # resume: skip wells already in the output CSV (results append per well,
-    # so an interrupted run keeps its progress)
+def bench_well(well_dir: str) -> list[dict]:
+    """Run the full pipeline on one well; returns result/error rows."""
+    well = os.path.basename(well_dir)
+    scans = glob.glob(os.path.join(well_dir, "scan_*"))
+    las_files = glob.glob(os.path.join(well_dir, "las_*"))
+    if not scans or not las_files:
+        return []
+    scan = scans[0]
+    rows: list[dict] = []
+
+    try:
+        layout = detect_layout(scan)
+        cal = calibrate_depth(scan, layout)
+        layout = reanchor_tracks(layout, cal.depth_band)
+    except Exception as e:
+        return [dict(well=well, stage="depth",
+                     error=f"{type(e).__name__}: {str(e)[:60]}")]
+
+    try:
+        las = lasio.read(las_files[0])
+    except Exception as e:
+        return [dict(well=well, stage="las",
+                     error=f"{type(e).__name__}: {str(e)[:60]}")]
+
+    gray = load_gray(scan)
+    scan_rows = np.arange(layout.log_top, layout.log_bottom)
+    scan_depths = cal.slope * scan_rows + cal.intercept
+
+    for t_idx, track in enumerate(layout.tracks):
+        try:
+            traces = extract_track_curves(
+                gray, track, layout.log_top, layout.log_bottom, n_curves=2)
+        except Exception as e:
+            rows.append(dict(well=well, stage=f"trace_t{t_idx}",
+                             error=f"{type(e).__name__}: {str(e)[:60]}"))
+            continue
+        for c_idx, trace in enumerate(traces):
+            mnem, r, lag = best_las_match(trace, scan_depths, las)
+            rows.append(dict(
+                well=well, stage="ok", track=t_idx, curve=c_idx,
+                trace_std=round(float(np.std(trace)), 3),
+                match=mnem, r=round(r, 3), lag_ft=lag,
+                rms_ft=round(cal.rms_residual_ft, 2),
+            ))
+    return rows
+
+
+def run(pairs_dir: str = "data/pairs", out_csv: str = "data/benchmark.csv",
+        workers: int = 3, limit: int | None = None):
+    # resume: skip wells already in the output CSV; results append per well,
+    # so an interrupted run keeps its progress
     done = set()
     if os.path.exists(out_csv):
         done = set(pd.read_csv(out_csv, dtype=str).well)
 
-    rows = []
+    todo = []
     for well_dir in sorted(glob.glob(os.path.join(pairs_dir, "*"))):
-        well = os.path.basename(well_dir)
-        if well in done:
+        if os.path.basename(well_dir) in done:
             continue
-        scans = glob.glob(os.path.join(well_dir, "scan_*"))
-        las_files = glob.glob(os.path.join(well_dir, "las_*"))
-        if not scans or not las_files:
-            continue
-        def flush():
-            new = [r for r in rows if r["well"] == well]
-            if new:
-                # fixed schema: error rows and result rows must align
-                pd.DataFrame(new).reindex(columns=COLUMNS).to_csv(
-                    out_csv, mode="a", index=False,
-                    header=not os.path.exists(out_csv))
+        if (glob.glob(os.path.join(well_dir, "scan_*"))
+                and glob.glob(os.path.join(well_dir, "las_*"))):
+            todo.append(well_dir)
+    if limit:
+        todo = todo[:limit]
+    print(f"{len(todo)} wells to benchmark, {workers} workers", flush=True)
 
-        scan = scans[0]
-        try:
-            layout = detect_layout(scan)
-            cal = calibrate_depth(scan, layout)
-            layout = reanchor_tracks(layout, cal.depth_band)
-        except Exception as e:
-            rows.append(dict(well=well, stage="depth",
-                             error=f"{type(e).__name__}: {str(e)[:60]}"))
-            flush()
-            continue
+    def flush(rows):
+        if rows:
+            pd.DataFrame(rows).reindex(columns=COLUMNS).to_csv(
+                out_csv, mode="a", index=False,
+                header=not os.path.exists(out_csv))
 
-        try:
-            las = lasio.read(las_files[0])
-        except Exception as e:
-            rows.append(dict(well=well, stage="las",
-                             error=f"{type(e).__name__}: {str(e)[:60]}"))
-            flush()
-            continue
+    if workers <= 1:
+        for wd in todo:
+            flush(bench_well(wd))
+            print(f"{os.path.basename(wd)}: done", flush=True)
+    else:
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")  # each worker gets its own OCR model
+        with ctx.Pool(workers) as pool:
+            for rows in pool.imap_unordered(bench_well, todo):
+                flush(rows)
+                if rows:
+                    print(f"{rows[0]['well']}: done", flush=True)
 
-        gray = load_gray(scan)
-        scan_rows = np.arange(layout.log_top, layout.log_bottom)
-        scan_depths = cal.slope * scan_rows + cal.intercept
-
-        for t_idx, track in enumerate(layout.tracks):
-            try:
-                traces = extract_track_curves(
-                    gray, track, layout.log_top, layout.log_bottom, n_curves=2)
-            except Exception as e:
-                rows.append(dict(well=well, stage=f"trace_t{t_idx}",
-                                 error=f"{type(e).__name__}: {str(e)[:60]}"))
-                continue
-            for c_idx, trace in enumerate(traces):
-                mnem, r, lag = best_las_match(trace, scan_depths, las)
-                rows.append(dict(
-                    well=well, stage="ok", track=t_idx, curve=c_idx,
-                    trace_std=round(float(np.std(trace)), 3),
-                    match=mnem, r=round(r, 3), lag_ft=lag,
-                    rms_ft=round(cal.rms_residual_ft, 2),
-                ))
-        print(f"{well}: done", flush=True)
-        flush()  # append incrementally so interruptions don't lose progress
-
-    df = pd.read_csv(out_csv) if os.path.exists(out_csv) else pd.DataFrame(rows)
+    df = pd.read_csv(out_csv) if os.path.exists(out_csv) else pd.DataFrame()
     ok = df[df.stage == "ok"]
     if len(ok):
         strong = ok[ok.r.abs() >= 0.7]
@@ -133,4 +155,9 @@ def run(pairs_dir: str = "data/pairs", out_csv: str = "data/benchmark.csv"):
 
 
 if __name__ == "__main__":
-    run()
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--workers", type=int, default=3)
+    p.add_argument("--limit", type=int, default=None)
+    a = p.parse_args()
+    run(workers=a.workers, limit=a.limit)
