@@ -58,12 +58,17 @@ def write_las(path: str, layout: Layout, cal: DepthCalibration,
 
     for t_idx, curves in sorted(track_curves.items()):
         for c_idx, curve in enumerate(curves):
-            c_sorted = np.asarray(curve)[order]
+            if isinstance(curve, dict):  # named + scaled curve spec
+                name, unit = curve["name"], curve["unit"]
+                values, descr = curve["values"], curve.get("descr", "")
+            else:                        # bare normalized trace
+                name, unit = f"TRK{t_idx}_C{c_idx}", "norm"
+                values = curve
+                descr = f"track {t_idx} curve {c_idx} (normalized position)"
+            c_sorted = np.asarray(values)[order]
             resampled = np.interp(grid, d_sorted, c_sorted,
                                   left=np.nan, right=np.nan)
-            las.append_curve(
-                f"TRK{t_idx}_C{c_idx}", resampled, unit="norm",
-                descr=f"track {t_idx} curve {c_idx} (normalized position)")
+            las.append_curve(name, resampled, unit=unit, descr=descr)
 
     with open(path, "w") as f:
         las.write(f, version=2.0)

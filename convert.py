@@ -10,12 +10,54 @@ import argparse
 import os
 import warnings
 
+import numpy as np
+
 from extraction.layout import detect_layout, load_gray, reanchor_tracks
 from extraction.depth import calibrate_depth
 from extraction.curves import extract_track_curves
+from extraction.header import read_header
 from export.las_writer import write_las
 
 warnings.filterwarnings("ignore")
+
+
+def _assign_curves(traces: list, scales: list) -> list:
+    """Pair traced curves with header-identified curves (v0 heuristics).
+
+    - GR + CALI in one track: GR is the variable trace, CALI the flat one
+    - otherwise scales (top-down) map to traces in traced order
+    Traces without a scale stay normalized; names get '?' when the pairing
+    is a guess so users know to verify.
+    """
+    out = []
+    mnems = {s.mnemonic for s in scales}
+    stds = [float(np.std(t)) for t in traces]
+
+    if {"GR", "CALI"} <= mnems and len(traces) >= 2:
+        gr_i = int(np.argmax(stds))
+        by_m = {s.mnemonic: s for s in scales}
+        pairs = [(traces[gr_i], by_m["GR"]),
+                 (traces[1 - gr_i], by_m["CALI"])]
+    else:
+        pairs = list(zip(traces, scales))
+
+    used = {id(t) for t, _ in pairs}
+    for trace, scale in pairs:
+        sure = {"GR", "CALI"} <= mnems or len(scales) == len(traces) == 1
+        name = scale.mnemonic if sure else scale.mnemonic + "?"
+        if scale.left_value is not None and scale.right_value is not None:
+            values = scale.left_value + np.asarray(trace) * (
+                scale.right_value - scale.left_value)
+            out.append(dict(name=name, unit=scale.unit, values=values,
+                            descr="scaled from header scale line"))
+        else:
+            out.append(dict(name=name, unit="norm", values=trace,
+                            descr="header named it; no scale endpoints "
+                                  "printed - normalized 0..1"))
+    for trace in traces:
+        if id(trace) not in used:
+            out.append(trace)
+    return out
 
 
 def convert(scan_path: str, out_path: str | None = None,
@@ -37,14 +79,24 @@ def convert(scan_path: str, out_path: str | None = None,
     print(f"      {cal.n_inliers} labels, RMS {cal.rms_residual_ft:.2f} ft, "
           f"depth {d0:.0f}-{d1:.0f} ft, depth column {layout.depth_col}")
 
-    print("[3/4] curve tracing")
+    print("[3/4] curve tracing + header identification")
+    try:
+        scales = read_header(scan_path, layout)
+    except Exception:
+        scales = []
+    for s in scales:
+        print(f"      header: track {s.track} {s.mnemonic} [{s.unit}] "
+              f"{s.left_value} -> {s.right_value}")
+
     gray = load_gray(scan_path)
     track_curves = {}
     for t_idx, track in enumerate(layout.tracks):
-        track_curves[t_idx] = extract_track_curves(
+        traces = extract_track_curves(
             gray, track, layout.log_top, layout.log_bottom,
             n_curves=curves_per_track)
-        print(f"      track {t_idx}: {curves_per_track} curves traced")
+        t_scales = [s for s in scales if s.track == t_idx]
+        track_curves[t_idx] = _assign_curves(traces, t_scales)
+        print(f"      track {t_idx}: {len(traces)} curves traced")
 
     print("[4/4] writing LAS")
     write_las(out_path, layout, cal, track_curves,
