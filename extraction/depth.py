@@ -186,12 +186,22 @@ def calibrate_depth(path: str, layout: Layout) -> DepthCalibration:
     dpi = layout.width / 8.25
 
     # scoring heuristics can rank the wrong band first; OCR success is the
-    # real arbiter, so try candidates until one yields enough labels
+    # real arbiter, so try candidates until one yields enough labels.
+    # The trained digit reader (if a model exists) runs alongside easyocr;
+    # the consensus fit downstream arbitrates disagreements.
+    from . import digit_reader
+
     points, used_band = [], None
     for left, right in candidates[:3]:
         band = gray[layout.log_top:layout.log_bottom, left + 3:right - 2]
         points = [(layout.log_top + row, depth)
                   for row, depth in _ocr_depth_labels(band, dpi)]
+        if digit_reader.available():
+            for row, depth in digit_reader.read_labels(band, dpi):
+                abs_row = layout.log_top + row
+                if not any(abs(abs_row - r) < 20 and depth == d
+                           for r, d in points):
+                    points.append((abs_row, depth))
         if len(points) >= 3:
             used_band = (left, right)
             break
