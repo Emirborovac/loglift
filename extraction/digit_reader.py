@@ -68,16 +68,14 @@ def read_blob(band: np.ndarray, top: int, bottom: int,
               min_conf: float = 0.85) -> int | None:
     """CRNN-read one blob; returns the integer value or None."""
     import torch
-    from training.train_digits import CHARS, BLANK, IMG_H, ctc_decode
+    from training.train_digits import (CHARS, BLANK, ctc_decode,
+                                       to_model_input)
 
     crop = band[top:bottom]
     if crop.size == 0:
         return None
-    im = Image.fromarray(crop)
-    w = max(8, int(im.width * IMG_H / im.height))
-    im = im.resize((min(w, 256), IMG_H), Image.BILINEAR)
-    x = torch.from_numpy(
-        np.asarray(im, dtype=np.float32)[None, None] / 255.0)
+    # identical normalization to training (border strip, unrotate, resize)
+    x = torch.from_numpy(to_model_input(crop)[None, None])
 
     m = _model()
     if next(m.parameters()).is_cuda:

@@ -40,6 +40,42 @@ def encode(text: str) -> list[int]:
     return [CHARS.index(c) for c in text]
 
 
+def normalize_crop(arr: np.ndarray) -> np.ndarray:
+    """Make a raw band crop model-ready: strip border lines, tight-crop to
+    the ink, and unrotate labels printed at 90 degrees.
+
+    Shared by training and inference (extraction.digit_reader).
+    """
+    a = arr.astype(np.float32)
+    if a.max() > 1.5:
+        a = a / 255.0
+    dark = a < 0.5
+
+    # remove full-height vertical border lines
+    col_frac = dark.mean(axis=0)
+    dark[:, col_frac > 0.75] = False
+
+    ys, xs = np.where(dark)
+    if len(ys) > 10:
+        y0, y1 = ys.min(), ys.max() + 1
+        x0, x1 = xs.min(), xs.max() + 1
+        a = a[max(0, y0 - 3):y1 + 3, max(0, x0 - 3):x1 + 3]
+
+    # labels rotated 90 deg read top-to-bottom: tall ink box -> unrotate
+    if a.shape[0] > 1.4 * a.shape[1]:
+        a = np.rot90(a, k=-1).copy()
+    return a
+
+
+def to_model_input(arr: np.ndarray) -> np.ndarray:
+    """Resize a normalized crop to model height, values 0..1."""
+    a = normalize_crop(arr)
+    im = Image.fromarray((a * 255).astype(np.uint8))
+    w = max(8, int(im.width * IMG_H / max(1, im.height)))
+    im = im.resize((min(w, MAX_W), IMG_H), Image.BILINEAR)
+    return np.asarray(im, dtype=np.float32) / 255.0
+
+
 class LabelCrops(Dataset):
     def __init__(self, rows: list[dict], augment: bool):
         self.rows = rows
@@ -49,11 +85,7 @@ class LabelCrops(Dataset):
         return len(self.rows)
 
     def _load(self, path: str) -> np.ndarray:
-        im = Image.open(path).convert("L")
-        # normalize height, keep aspect
-        w = max(8, int(im.width * IMG_H / im.height))
-        im = im.resize((min(w, MAX_W), IMG_H), Image.BILINEAR)
-        return np.asarray(im, dtype=np.float32) / 255.0
+        return to_model_input(np.asarray(Image.open(path).convert("L")))
 
     def __getitem__(self, i):
         row = self.rows[i]
@@ -67,6 +99,24 @@ class LabelCrops(Dataset):
                 arr = np.roll(arr, random.randint(-2, 2), axis=0)
         target = encode(str(int(row["value"])))
         return torch.from_numpy(arr)[None], torch.tensor(target)
+
+
+class SynthCrops(Dataset):
+    """On-the-fly synthetic labels for pretraining (see training.synth)."""
+
+    def __init__(self, n: int):
+        self.n = n
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, i):
+        from training.synth import render
+        arr, text = render()
+        if random.random() < 0.25:  # quarter of real labels are rotated
+            arr = np.rot90(arr).copy()
+        x = to_model_input(arr)
+        return torch.from_numpy(x)[None], torch.tensor(encode(text))
 
 
 def collate(batch):
@@ -112,29 +162,25 @@ def ctc_decode(logits: torch.Tensor) -> str:
     return "".join(out)
 
 
-def main(epochs: int = 60, batch: int = 32, lr: float = 1e-3):
-    with open(MANIFEST) as f:
-        rows = list(csv.DictReader(f))
-    wells = sorted({r["well"] for r in rows})
-    random.Random(7).shuffle(wells)
-    val_wells = set(wells[:max(1, len(wells) // 5)])
-    train_rows = [r for r in rows if r["well"] not in val_wells]
-    val_rows = [r for r in rows if r["well"] in val_wells]
-    print(f"crops: {len(train_rows)} train / {len(val_rows)} val "
-          f"({len(wells)} wells, {len(val_wells)} held out)")
+def _evaluate(model, val_dl, device) -> float:
+    model.eval()
+    correct = n = 0
+    with torch.no_grad():
+        for imgs, targets, tlens, widths in val_dl:
+            logits = model(imgs.to(device))
+            pos = 0
+            for bi in range(imgs.shape[0]):
+                truth = "".join(CHARS[t] for t in
+                                targets[pos:pos + tlens[bi]].tolist())
+                pos += int(tlens[bi])
+                correct += ctc_decode(logits[bi]) == truth
+                n += 1
+    return correct / max(1, n)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = CRNN().to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+
+def _train_phase(model, opt, train_dl, val_dl, epochs, device,
+                 name, best_acc):
     ctc = nn.CTCLoss(blank=BLANK, zero_infinity=True)
-
-    train_dl = DataLoader(LabelCrops(train_rows, True), batch_size=batch,
-                          shuffle=True, collate_fn=collate)
-    val_dl = DataLoader(LabelCrops(val_rows, False), batch_size=batch,
-                        shuffle=False, collate_fn=collate)
-
-    best_acc = 0.0
-    os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
     for ep in range(1, epochs + 1):
         model.train()
         total = 0.0
@@ -148,29 +194,51 @@ def main(epochs: int = 60, batch: int = 32, lr: float = 1e-3):
             opt.zero_grad(); loss.backward(); opt.step()
             total += float(loss)
 
-        model.eval()
-        correct = n = 0
-        with torch.no_grad():
-            for imgs, targets, tlens, widths in val_dl:
-                logits = model(imgs.to(device))
-                pos = 0
-                for bi in range(imgs.shape[0]):
-                    truth = "".join(CHARS[t] for t in
-                                    targets[pos:pos + tlens[bi]].tolist())
-                    pos += int(tlens[bi])
-                    correct += ctc_decode(logits[bi]) == truth
-                    n += 1
-        acc = correct / max(1, n)
+        acc = _evaluate(model, val_dl, device)
         if acc > best_acc:
             best_acc = acc
             torch.save(dict(state=model.state_dict(), chars=CHARS,
                             img_h=IMG_H), MODEL_OUT)
-        if ep % 5 == 0 or ep == 1:
-            print(f"epoch {ep:3d}  loss {total/len(train_dl):.3f}  "
-                  f"val exact-match {acc:.1%}  (best {best_acc:.1%})",
-                  flush=True)
+        print(f"{name} {ep:3d}  loss {total/len(train_dl):.3f}  "
+              f"real-val exact-match {acc:.1%}  (best {best_acc:.1%})",
+              flush=True)
+    return best_acc
 
-    print(f"best val exact-match: {best_acc:.1%} -> {MODEL_OUT}")
+
+def main(epochs: int = 40, batch: int = 32, lr: float = 1e-3,
+         synth_epochs: int = 6, synth_per_epoch: int = 24000):
+    with open(MANIFEST) as f:
+        rows = list(csv.DictReader(f))
+    wells = sorted({r["well"] for r in rows})
+    random.Random(7).shuffle(wells)
+    val_wells = set(wells[:max(1, len(wells) // 5)])
+    train_rows = [r for r in rows if r["well"] not in val_wells]
+    val_rows = [r for r in rows if r["well"] in val_wells]
+    print(f"crops: {len(train_rows)} train / {len(val_rows)} val "
+          f"({len(wells)} wells, {len(val_wells)} held out)")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = CRNN().to(device)
+    os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
+
+    val_dl = DataLoader(LabelCrops(val_rows, False), batch_size=batch,
+                        shuffle=False, collate_fn=collate)
+
+    # phase 1: pretrain on unlimited synthetic labels (validated on REAL)
+    synth_dl = DataLoader(SynthCrops(synth_per_epoch), batch_size=batch,
+                          shuffle=False, collate_fn=collate, num_workers=0)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    best = _train_phase(model, opt, synth_dl, val_dl, synth_epochs,
+                        device, "synth", 0.0)
+
+    # phase 2: fine-tune on real crops at a lower learning rate
+    real_dl = DataLoader(LabelCrops(train_rows, True), batch_size=batch,
+                         shuffle=True, collate_fn=collate)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr / 4)
+    best = _train_phase(model, opt, real_dl, val_dl, epochs,
+                        device, "real ", best)
+
+    print(f"best real-val exact-match: {best:.1%} -> {MODEL_OUT}")
 
 
 if __name__ == "__main__":
