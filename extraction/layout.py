@@ -210,14 +210,17 @@ def _find_depth_column(dark: np.ndarray, log_top: int, log_bottom: int,
         if interior.size == 0 or interior.mean() > 0.10:
             continue  # gridded/curve band, not a depth column
         # depth labels are SPARSE: the column is blank between labels, while
-        # a curve band has ink on nearly every row
+        # a curve band has ink on nearly every row. Filters stay loose on
+        # purpose: calibration OCR tries candidates in order and is the real
+        # gatekeeper, so a false candidate costs time, not correctness.
         row_ink = (interior.mean(axis=1) > 0.02).mean()
-        if row_ink > 0.25:
+        if row_ink > 0.5:
             continue
         blobs = _digit_blob_count(interior, dpi)
-        # plausible label count: a handful at least, at most ~2.5 per inch
-        if 4 <= blobs <= max(8.0, 2.5 * height_in):
-            scored.append((blobs, (left, right)))
+        # plausible label count: a few at least, at most ~4 per inch
+        if 3 <= blobs <= max(12.0, 4.0 * height_in):
+            # prefer sparse bands with many digit-sized blobs
+            scored.append((blobs * (1.0 - row_ink), (left, right)))
 
     scored.sort(key=lambda t: -t[0])
     return [band for _, band in scored]
@@ -289,6 +292,26 @@ def detect_layout(path: str) -> Layout:
         tracks=tracks,
         depth_col_candidates=depth_candidates,
     )
+
+
+def reanchor_tracks(layout: Layout, band: tuple[int, int]) -> Layout:
+    """Re-anchor tracks to the depth band that calibration actually used.
+
+    The top-ranked candidate can be wrong; once OCR confirms a band, track
+    boundaries must follow it (track 1 left of it, tracks 2-3 right of it).
+    """
+    if band is None or not layout.track_borders:
+        return layout
+    dl, dr = band
+    min_track_w = 0.08 * layout.width
+    tracks = []
+    if dl - layout.track_borders[0] >= min_track_w:
+        tracks.append((layout.track_borders[0], dl))
+    if layout.track_borders[-1] - dr >= min_track_w:
+        tracks.append((dr, layout.track_borders[-1]))
+    layout.depth_col = band
+    layout.tracks = tracks
+    return layout
 
 
 def draw_layout(path: str, layout: Layout, out_path: str,

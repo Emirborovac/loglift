@@ -42,6 +42,7 @@ class DepthCalibration:
     n_inliers: int          # labels surviving consensus
     rms_residual_ft: float  # fit quality
     labels: list            # (row, depth) inliers, for debugging
+    depth_band: tuple | None = None  # (x_left, x_right) band that OCR'd
 
     def depth_at(self, row: float) -> float:
         return self.slope * row + self.intercept
@@ -186,12 +187,13 @@ def calibrate_depth(path: str, layout: Layout) -> DepthCalibration:
 
     # scoring heuristics can rank the wrong band first; OCR success is the
     # real arbiter, so try candidates until one yields enough labels
-    points = []
+    points, used_band = [], None
     for left, right in candidates[:3]:
         band = gray[layout.log_top:layout.log_bottom, left + 3:right - 2]
         points = [(layout.log_top + row, depth)
                   for row, depth in _ocr_depth_labels(band, dpi)]
         if len(points) >= 3:
+            used_band = (left, right)
             break
 
     if len(points) < 3:
@@ -216,4 +218,5 @@ def calibrate_depth(path: str, layout: Layout) -> DepthCalibration:
         n_inliers=len(inliers),
         rms_residual_ft=rms,
         labels=inliers,
+        depth_band=used_band,
     )

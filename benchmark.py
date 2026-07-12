@@ -22,7 +22,7 @@ import lasio
 import numpy as np
 import pandas as pd
 
-from extraction.layout import detect_layout, load_gray
+from extraction.layout import detect_layout, load_gray, reanchor_tracks
 from extraction.depth import calibrate_depth
 from extraction.curves import extract_track_curves
 
@@ -51,21 +51,43 @@ def best_las_match(trace: np.ndarray, scan_depths: np.ndarray,
     return best
 
 
+COLUMNS = ["well", "stage", "error", "track", "curve", "trace_std",
+           "match", "r", "lag_ft", "rms_ft"]
+
+
 def run(pairs_dir: str = "data/pairs", out_csv: str = "data/benchmark.csv"):
+    # resume: skip wells already in the output CSV (results append per well,
+    # so an interrupted run keeps its progress)
+    done = set()
+    if os.path.exists(out_csv):
+        done = set(pd.read_csv(out_csv, dtype=str).well)
+
     rows = []
     for well_dir in sorted(glob.glob(os.path.join(pairs_dir, "*"))):
         well = os.path.basename(well_dir)
+        if well in done:
+            continue
         scans = glob.glob(os.path.join(well_dir, "scan_*"))
         las_files = glob.glob(os.path.join(well_dir, "las_*"))
         if not scans or not las_files:
             continue
+        def flush():
+            new = [r for r in rows if r["well"] == well]
+            if new:
+                # fixed schema: error rows and result rows must align
+                pd.DataFrame(new).reindex(columns=COLUMNS).to_csv(
+                    out_csv, mode="a", index=False,
+                    header=not os.path.exists(out_csv))
+
         scan = scans[0]
         try:
             layout = detect_layout(scan)
             cal = calibrate_depth(scan, layout)
+            layout = reanchor_tracks(layout, cal.depth_band)
         except Exception as e:
             rows.append(dict(well=well, stage="depth",
                              error=f"{type(e).__name__}: {str(e)[:60]}"))
+            flush()
             continue
 
         try:
@@ -73,6 +95,7 @@ def run(pairs_dir: str = "data/pairs", out_csv: str = "data/benchmark.csv"):
         except Exception as e:
             rows.append(dict(well=well, stage="las",
                              error=f"{type(e).__name__}: {str(e)[:60]}"))
+            flush()
             continue
 
         gray = load_gray(scan)
@@ -95,11 +118,10 @@ def run(pairs_dir: str = "data/pairs", out_csv: str = "data/benchmark.csv"):
                     match=mnem, r=round(r, 3), lag_ft=lag,
                     rms_ft=round(cal.rms_residual_ft, 2),
                 ))
-        print(f"{well}: done")
+        print(f"{well}: done", flush=True)
+        flush()  # append incrementally so interruptions don't lose progress
 
-    df = pd.DataFrame(rows)
-    df.to_csv(out_csv, index=False)
-
+    df = pd.read_csv(out_csv) if os.path.exists(out_csv) else pd.DataFrame(rows)
     ok = df[df.stage == "ok"]
     if len(ok):
         strong = ok[ok.r.abs() >= 0.7]
