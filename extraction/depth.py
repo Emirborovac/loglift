@@ -142,38 +142,57 @@ def _ocr_depth_labels(band: np.ndarray, dpi: float,
     return points
 
 
-def _consensus_fit(points: list[tuple[float, float]]) -> tuple[float, float, list]:
-    """Robust line fit through (row, depth) points.
+def _consensus_fit(points: list[tuple[float, float]],
+                   slope_bounds: tuple[float, float] | None = None
+                   ) -> tuple[float, float, list]:
+    """RANSAC line fit through (row, depth) points.
 
-    Depth labels are evenly spaced, so the true slope is the strong mode of
-    pairwise slopes. Points agreeing with the consensus line are inliers.
+    OCR (especially the trained model on hard scans) yields a mix of good
+    labels and repeated misreads; a median of pairwise slopes collapses to
+    zero under duplicates. RANSAC instead tries every point pair as a line
+    hypothesis, keeps only physically plausible slopes, and picks the line
+    with the most inliers.
     """
     pts = sorted(points)
-    slopes = []
-    for i in range(len(pts) - 1):
-        (r1, d1), (r2, d2) = pts[i], pts[i + 1]
-        if r2 - r1 > 10:
-            slopes.append((d2 - d1) / (r2 - r1))
-    if not slopes:
+    if len(pts) < 3:
         raise ValueError("not enough labels for a slope estimate")
-    slope = float(np.median(slopes))
 
-    # intercept consensus with the median slope
-    intercepts = [d - slope * r for r, d in pts]
-    intercept = float(np.median(intercepts))
+    lo, hi = slope_bounds if slope_bounds else (1e-6, np.inf)
 
-    # inliers: within a tolerance of the consensus line
-    tol = max(5.0, abs(slope) * 40)  # ~40 rows of drift allowed
-    inliers = [(r, d) for r, d in pts if abs(d - (slope * r + intercept)) <= tol]
-    if len(inliers) < 3:
-        raise ValueError(f"only {len(inliers)} labels agree with consensus")
+    best_inliers: list = []
+    best_rms = np.inf
+    for i in range(len(pts) - 1):
+        for j in range(i + 1, len(pts)):
+            (r1, d1), (r2, d2) = pts[i], pts[j]
+            if r2 - r1 < 50 or d2 == d1:
+                continue
+            slope = (d2 - d1) / (r2 - r1)
+            if not (lo <= slope <= hi):
+                continue
+            intercept = d1 - slope * r1
+            tol = max(5.0, slope * 40)  # ~40 rows of drift allowed
+            inliers = [(r, d) for r, d in pts
+                       if abs(d - (slope * r + intercept)) <= tol]
+            # score by DISTINCT depth values: a true depth scale passes many
+            # different round numbers; junk lines are built from repeated
+            # misreads of the same few values
+            distinct = len({d for _, d in inliers})
+            if distinct < 3:
+                continue
+            rms = float(np.sqrt(np.mean(
+                [(d - (slope * r + intercept)) ** 2 for r, d in inliers])))
+            best_distinct = len({d for _, d in best_inliers})
+            if (distinct, -rms) > (best_distinct, -best_rms):
+                best_inliers, best_rms = inliers, rms
 
-    # final least-squares fit on inliers
-    rows = np.array([r for r, _ in inliers])
-    depths = np.array([d for _, d in inliers])
+    if len(best_inliers) < 3:
+        raise ValueError(f"only {len(best_inliers)} labels agree with consensus")
+
+    rows = np.array([r for r, _ in best_inliers])
+    depths = np.array([d for _, d in best_inliers])
     A = np.vstack([rows, np.ones_like(rows)]).T
     (m, b), *_ = np.linalg.lstsq(A, depths, rcond=None)
-    return float(m), float(b), inliers
+    return float(m), float(b), best_inliers
 
 
 def calibrate_depth(path: str, layout: Layout) -> DepthCalibration:
@@ -185,13 +204,18 @@ def calibrate_depth(path: str, layout: Layout) -> DepthCalibration:
     gray = load_gray(path)
     dpi = layout.width / 8.25
 
-    # scoring heuristics can rank the wrong band first; OCR success is the
-    # real arbiter, so try candidates until one yields enough labels.
-    # The trained digit reader (if a model exists) runs alongside easyocr;
-    # the consensus fit downstream arbitrates disagreements.
+    # scoring heuristics can rank the wrong band first, and OCR (especially
+    # the trained model) can produce confident junk in a wrong band. So a
+    # band only wins by producing labels that FIT A LINE: fit every
+    # candidate and keep the best fit by distinct-inlier count.
     from . import digit_reader
 
-    points, used_band = [], None
+    # physical slope bounds: depth increases downward and log scales run
+    # ~1:120 to 1:1200, i.e. roughly 4-120 ft of depth per inch of paper
+    slope_bounds = (4.0 / dpi, 120.0 / dpi)
+
+    best = None
+    last_err = "no depth labels OCR'd in any candidate band"
     for left, right in candidates[:3]:
         band = gray[layout.log_top:layout.log_bottom, left + 3:right - 2]
         points = [(layout.log_top + row, depth)
@@ -202,17 +226,26 @@ def calibrate_depth(path: str, layout: Layout) -> DepthCalibration:
                 if not any(abs(abs_row - r) < 20 and depth == d
                            for r, d in points):
                     points.append((abs_row, depth))
-        if len(points) >= 3:
-            used_band = (left, right)
-            break
+        if len(points) < 3:
+            last_err = f"only {len(points)} depth labels OCR'd"
+            continue
+        try:
+            slope, intercept, inliers = _consensus_fit(
+                points, slope_bounds=slope_bounds)
+        except ValueError as e:
+            last_err = str(e)
+            continue
+        n_distinct = len({d for _, d in inliers})
+        rms = float(np.sqrt(np.mean(
+            [(d - (slope * r + intercept)) ** 2 for r, d in inliers])))
+        key = (n_distinct, -rms)
+        if best is None or key > best[0]:
+            best = (key, slope, intercept, inliers, points, (left, right))
 
-    if len(points) < 3:
-        raise ValueError(f"only {len(points)} depth labels OCR'd")
+    if best is None:
+        raise ValueError(last_err)
+    _, slope, intercept, inliers, points, used_band = best
 
-    slope, intercept, inliers = _consensus_fit(points)
-
-    # physical sanity: on a scan, depth increases downward and log scales
-    # run ~1:120 to 1:1200, i.e. roughly 4-120 ft of depth per inch of paper
     ft_per_inch = slope * dpi
     if not (4.0 <= ft_per_inch <= 120.0):
         raise ValueError(f"implausible scale: {ft_per_inch:.1f} ft/inch")
