@@ -226,10 +226,55 @@ def _find_depth_column(dark: np.ndarray, log_top: int, log_bottom: int,
     return [band for _, band in scored]
 
 
+def _sliding_depth_candidates(dark: np.ndarray, log_top: int,
+                              log_bottom: int) -> list[tuple[int, int]]:
+    """Depth-column candidates without relying on detected borders.
+
+    Dense or degraded strips often defeat border chaining, leaving no
+    bands to score. Fall back to sliding a window across the section and
+    keeping sparse, digit-bearing bands. Downstream calibration still has
+    the final say (a candidate only wins by fitting a depth line).
+    """
+    w = dark.shape[1]
+    dpi = w / 8.25
+    section = dark[log_top:log_bottom:4]  # row-subsampled: profiles only
+    col_ink = section.mean(axis=0)
+
+    win = int(0.75 * dpi)
+    stride = max(4, int(0.1 * dpi))
+    height_in = (log_bottom - log_top) / dpi
+
+    scored = []
+    for x in range(0, w - win, stride):
+        interior = col_ink[x + 2:x + win - 2]
+        if interior.mean() > 0.10:
+            continue
+        band = section[:, x + 2:x + win - 2]
+        row_ink = (band.mean(axis=1) > 0.02).mean()
+        if row_ink > 0.5:
+            continue
+        blobs = _digit_blob_count(dark[log_top:log_bottom, x + 2:x + win - 2],
+                                  dpi)
+        if 3 <= blobs <= max(12.0, 4.0 * height_in):
+            scored.append((blobs * (1.0 - row_ink), x, x + win))
+
+    # non-maximum suppression: keep best-scoring, drop overlapping windows
+    scored.sort(key=lambda t: -t[0])
+    kept: list[tuple[int, int]] = []
+    for _, left, right in scored:
+        if all(right <= kl or left >= kr for kl, kr in kept):
+            kept.append((left, right))
+        if len(kept) >= 3:
+            break
+    return kept
+
+
 def _analyze_section(dark: np.ndarray, log_top: int, log_bottom: int,
                      width: int) -> tuple[list[int], list, list]:
     borders = _find_track_borders(dark, log_top, log_bottom)
     depth_candidates = _find_depth_column(dark, log_top, log_bottom, borders)
+    if not depth_candidates:
+        depth_candidates = _sliding_depth_candidates(dark, log_top, log_bottom)
     depth_col = depth_candidates[0] if depth_candidates else None
 
     # Tracks are anchored to the depth column: track 1 spans from the strip's
