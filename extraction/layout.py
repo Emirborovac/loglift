@@ -23,7 +23,7 @@ Works on a downsampled copy for speed; returns full-resolution coordinates.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 import numpy as np
 from PIL import Image
@@ -45,6 +45,9 @@ class Layout:
     track_borders: list[int]    # x of vertical track border lines
     depth_col: tuple[int, int]  # (x_left, x_right) of the depth column
     tracks: list[tuple[int, int]]  # (x_left, x_right) per curve track
+    # fallback depth-column candidates, best first (incl. depth_col itself);
+    # depth calibration tries them in order until labels actually OCR
+    depth_col_candidates: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -181,20 +184,24 @@ def _digit_blob_count(interior: np.ndarray, dpi: float) -> int:
 
 
 def _find_depth_column(dark: np.ndarray, log_top: int, log_bottom: int,
-                       borders: list[int]) -> tuple[int, int] | None:
-    """Among bands between borders, pick the depth column.
+                       borders: list[int]) -> list[tuple[int, int]]:
+    """Ranked depth-column candidates among bands between borders.
 
     A depth column is (a) mostly white — no grid inside — and (b) contains
-    digit-sized ink blobs: the printed depth labels. Requiring the blobs is
-    what separates it from empty gutters on non-standard layouts.
+    digit-sized ink blobs: the printed depth labels. Scoring heuristics
+    misfire on odd layouts, so we return ALL plausible bands ranked by blob
+    count and let depth calibration try them in order — actual OCR success
+    is the final arbiter.
     """
     if len(borders) < 2:
-        return None
+        return []
     w = dark.shape[1]
     section = dark[log_top:log_bottom]
     dpi = w / 8.25  # log strips are ~8.25 in wide; fine as a rough scale
 
-    best, best_blobs = None, 0
+    height_in = (log_bottom - log_top) / dpi
+
+    scored = []
     for left, right in zip(borders, borders[1:]):
         band_w = right - left
         if not (0.02 * w <= band_w <= 0.15 * w):
@@ -202,30 +209,43 @@ def _find_depth_column(dark: np.ndarray, log_top: int, log_bottom: int,
         interior = section[:, left + 2:right - 1]
         if interior.size == 0 or interior.mean() > 0.10:
             continue  # gridded/curve band, not a depth column
+        # depth labels are SPARSE: the column is blank between labels, while
+        # a curve band has ink on nearly every row
+        row_ink = (interior.mean(axis=1) > 0.02).mean()
+        if row_ink > 0.25:
+            continue
         blobs = _digit_blob_count(interior, dpi)
-        if blobs > best_blobs:
-            best, best_blobs = (left, right), blobs
+        # plausible label count: a handful at least, at most ~2.5 per inch
+        if 4 <= blobs <= max(8.0, 2.5 * height_in):
+            scored.append((blobs, (left, right)))
 
-    # demand a handful of labels; one or two blobs is just specks/noise
-    if best is not None and best_blobs >= 4:
-        return best
-    return None
+    scored.sort(key=lambda t: -t[0])
+    return [band for _, band in scored]
 
 
 def _analyze_section(dark: np.ndarray, log_top: int, log_bottom: int,
-                     width: int) -> tuple[list[int], tuple | None, list]:
+                     width: int) -> tuple[list[int], list, list]:
     borders = _find_track_borders(dark, log_top, log_bottom)
-    depth_col = _find_depth_column(dark, log_top, log_bottom, borders)
+    depth_candidates = _find_depth_column(dark, log_top, log_bottom, borders)
+    depth_col = depth_candidates[0] if depth_candidates else None
 
-    # tracks = bands between consecutive borders, excluding the depth column
+    # Tracks are anchored to the depth column: track 1 spans from the strip's
+    # left edge to the column, tracks 2-3 from the column to the right edge.
+    # (Heavy scale lines also chain like borders, so bands between adjacent
+    # borders are unreliable track boundaries.)
     tracks = []
     min_track_w = 0.08 * width
-    for left, right in zip(borders, borders[1:]):
-        if depth_col is not None and (left, right) == depth_col:
-            continue
-        if right - left >= min_track_w:
-            tracks.append((left, right))
-    return borders, depth_col, tracks
+    if depth_col is not None and borders:
+        dl, dr = depth_col
+        if dl - borders[0] >= min_track_w:
+            tracks.append((borders[0], dl))
+        if borders[-1] - dr >= min_track_w:
+            tracks.append((dr, borders[-1]))
+    else:
+        for left, right in zip(borders, borders[1:]):
+            if right - left >= min_track_w:
+                tracks.append((left, right))
+    return borders, depth_candidates, tracks
 
 
 def detect_layout(path: str) -> Layout:
@@ -246,27 +266,28 @@ def detect_layout(path: str) -> Layout:
     best = None
     for top_s, bottom_s in sections:
         log_top, log_bottom = int(top_s / scale), int(bottom_s / scale)
-        borders, depth_col, tracks = _analyze_section(
+        borders, depth_candidates, tracks = _analyze_section(
             dark, log_top, log_bottom, gray.shape[1])
         # depth column is the strongest signal a section is a real log
-        score = (10 if depth_col else 0) + len(tracks) \
+        score = (10 if depth_candidates else 0) + len(tracks) \
             + 0.000001 * (log_bottom - log_top)
         if best is None or score > best[0]:
-            best = (score, log_top, log_bottom, borders, depth_col, tracks)
+            best = (score, log_top, log_bottom, borders, depth_candidates, tracks)
 
     if best is None:
         h = gray.shape[0]
-        best = (0, 0, h, [], None, [])
+        best = (0, 0, h, [], [], [])
 
-    _, log_top, log_bottom, borders, depth_col, tracks = best
+    _, log_top, log_bottom, borders, depth_candidates, tracks = best
     return Layout(
         width=gray.shape[1],
         height=gray.shape[0],
         log_top=log_top,
         log_bottom=log_bottom,
         track_borders=borders,
-        depth_col=depth_col,
+        depth_col=depth_candidates[0] if depth_candidates else None,
         tracks=tracks,
+        depth_col_candidates=depth_candidates,
     )
 
 
