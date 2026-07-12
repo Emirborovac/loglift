@@ -53,11 +53,23 @@ loglift/
 
 - [x] Problem researched and data availability verified
 - [x] KGS index pipeline (join scans ↔ LAS by API number)
-- [ ] Paired dataset builder (download + scan-to-LAS matching)
-- [ ] Track/grid layout detection
-- [ ] Curve extraction
-- [ ] Validation & LAS export
-- [ ] Benchmark against ground truth
+- [x] Paired dataset builder (62,006 matched pairs; parallel, resumable downloads)
+- [x] Track/grid layout detection (borders, depth column, sections)
+- [x] Depth calibration: OCR + trained CRNN digit reader + RANSAC line fit
+- [x] Curve extraction (Viterbi tracing, multi-curve per track)
+- [x] Header reading: curve names + engineering-unit scaling
+- [x] LAS export + single-command converter (`python convert.py scan.tif`)
+- [x] Web app (upload → review overlay → download LAS)
+- [x] Benchmark against ground truth (resumable, parallel)
+- [ ] Human-in-the-loop trace correction UI
+- [ ] International validation (NLOG, Australia)
+
+Current numbers (95-well benchmark, wells spanning 1930s–2020s):
+**54% calibrate depth fully automatically** (median RMS well under 1 ft);
+traced curves match ground-truth LAS at |r| ≥ 0.7 on the best wells;
+failures are explicit refusals, never fabricated output. The custom digit
+reader (trained on self-labeled crops) lifted calibration from 31% → 54%
+in its first training cycle.
 
 ## Data sources
 
