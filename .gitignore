@@ -1,5 +1,7 @@
 # local data — never commit well data files
 data/
+!data/models/
+!data/models/digit_crnn.pt
 
 __pycache__/
 *.pyc
