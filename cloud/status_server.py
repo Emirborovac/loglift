@@ -60,17 +60,56 @@ def crop_rate(crops: int) -> float:
 
 
 def stage() -> str:
-    log = tail(os.path.join(ROOT, "cycle1.log"), 200)
+    # read the WHOLE log for stage markers (they scroll out of any tail)
+    try:
+        log = open(os.path.join(ROOT, "cycle1.log"), errors="replace").read()
+    except OSError:
+        return "starting..."
     bench = os.path.join(ROOT, "data", "benchmark.csv")
-    if "Traceback" in log:
+    if "Traceback" in log[-4000:]:
         return "ERROR (see log tail)"
-    if os.path.exists(bench) and "== retrain" in log:
+    if os.path.exists(bench):
         return "BENCHMARK running"
-    if "exact-match" in log.split("== retrain")[-1] and "== retrain" in log:
+    if "== retrain" in log:
         return "TRAINING model"
     if "wells to harvest" in log:
         return "HARVEST running"
     return "starting..."
+
+
+_prog = {"t": 0.0, "idx": 0, "rate": 0.0}
+
+
+def progress() -> tuple[float, str]:
+    """(percent done, ETA) from the last contributing well's position in
+    the sorted well list — imap results arrive roughly in submission order,
+    so alphabetical position tracks the sweep without touching the workers.
+    """
+    try:
+        dirs = sorted(os.listdir(os.path.join(ROOT, "data", "pairs")))
+        with open(os.path.join(ROOT, "data", "label_crops",
+                               "manifest.csv")) as f:
+            last_well = list(csv.reader(f))[-1][2]
+        idx = dirs.index(last_well) + 1
+        total = len(dirs)
+    except (OSError, ValueError, IndexError):
+        return 0.0, "-"
+
+    now = time.time()
+    if _prog["t"] and idx > _prog["idx"]:
+        inst = (idx - _prog["idx"]) / (now - _prog["t"])  # wells/sec
+        _prog["rate"] = (0.5 * _prog["rate"] + 0.5 * inst
+                         if _prog["rate"] else inst)
+    if idx > _prog["idx"] or not _prog["t"]:
+        _prog["t"], _prog["idx"] = now, idx
+
+    pct = 100.0 * idx / max(1, total)
+    if _prog["rate"] > 0:
+        secs = (total - idx) / _prog["rate"]
+        eta = f"{int(secs//3600)}h {int(secs%3600//60)}m"
+    else:
+        eta = "measuring..."
+    return pct, eta
 
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
@@ -94,8 +133,12 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <main>
 <div class="stage">STAGE: {stage}</div>
 <div class="grid">
+ <div class="card">Harvest progress<b>{pct:.1f} %</b></div>
+ <div class="card">Est. time left (this stage)<b>{eta}</b></div>
  <div class="card">Wells contributed<b>{wells:,}</b></div>
  <div class="card">Training crops<b>{crops:,}</b></div>
+</div>
+<div class="grid">
  <div class="card">Crops / hour<b>{rate:,.0f}</b></div>
  <div class="card">Server uptime<b>{up}</b></div>
 </div>
@@ -116,12 +159,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         crops, wells = manifest_stats()
+        pct, eta = progress()
         gpus = sh("nvidia-smi --query-gpu=utilization.gpu,memory.used"
                   " --format=csv,noheader").splitlines() or ["?", "?"]
         up = int(time.time() - START)
         body = PAGE.format(
             now=time.strftime("%H:%M:%S UTC", time.gmtime()),
             stage=html.escape(stage()),
+            pct=pct, eta=html.escape(eta),
             wells=wells, crops=crops, rate=crop_rate(crops),
             up=f"{up//3600}h {up%3600//60}m",
             gpu0=html.escape(gpus[0] if gpus else "?"),
