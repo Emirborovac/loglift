@@ -14,7 +14,7 @@ echo "== harvest (workers=$WORKERS, gpus=$N_GPUS)"
 python -m training.harvest_labels --workers "$WORKERS"
 
 echo "== crop count"
-ls data/label_crops/*.png | wc -l
+find data/label_crops -name '*.png' | wc -l
 
 # guard: never retrain (and overwrite the model) on a failed harvest
 WELLS=$(tail -n +2 data/label_crops/manifest.csv | cut -d, -f3 | sort -u | wc -l)
