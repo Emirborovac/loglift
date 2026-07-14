@@ -222,18 +222,21 @@ def main(epochs: int = 40, batch: int = 32, lr: float = 1e-3,
     os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
 
     val_dl = DataLoader(LabelCrops(val_rows, False), batch_size=batch,
-                        shuffle=False, collate_fn=collate)
+                        shuffle=False, collate_fn=collate, num_workers=6,
+                        persistent_workers=True)
 
     # phase 1: pretrain on unlimited synthetic labels (validated on REAL)
     synth_dl = DataLoader(SynthCrops(synth_per_epoch), batch_size=batch,
-                          shuffle=False, collate_fn=collate, num_workers=0)
+                          shuffle=False, collate_fn=collate, num_workers=12,
+                          persistent_workers=True)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     best = _train_phase(model, opt, synth_dl, val_dl, synth_epochs,
                         device, "synth", 0.0)
 
     # phase 2: fine-tune on real crops at a lower learning rate
     real_dl = DataLoader(LabelCrops(train_rows, True), batch_size=batch,
-                         shuffle=True, collate_fn=collate)
+                         shuffle=True, collate_fn=collate, num_workers=12,
+                         persistent_workers=True)
     opt = torch.optim.AdamW(model.parameters(), lr=lr / 4)
     best = _train_phase(model, opt, real_dl, val_dl, epochs,
                         device, "real ", best)
