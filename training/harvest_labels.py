@@ -35,8 +35,22 @@ OUT_DIR = os.path.join("data", "label_crops")
 MANIFEST = os.path.join(OUT_DIR, "manifest.csv")
 
 
+def worker_init(counter, n_gpus: int):
+    """Assign each worker a GPU round-robin BEFORE any CUDA init.
+
+    Without this every worker lands on GPU 0; on multi-GPU boxes that OOMs
+    and the failures used to be swallowed silently (26-well 'success').
+    """
+    with counter.get_lock():
+        idx = counter.value
+        counter.value += 1
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(idx % max(1, n_gpus))
+
+
 def harvest_well(well_dir: str) -> list[tuple[str, int, str, int, float]]:
     """Process one well; saves crop PNGs, returns manifest rows."""
+    import sys
+
     well = os.path.basename(well_dir)
     scans = glob.glob(os.path.join(well_dir, "scan_*"))
     if not scans:
@@ -45,7 +59,13 @@ def harvest_well(well_dir: str) -> list[tuple[str, int, str, int, float]]:
     try:
         layout = detect_layout(scan)
         cal = calibrate_depth(scan, layout)
-    except Exception:
+    except Exception as e:
+        # infrastructure failures must be LOUD, not swallowed as "no labels"
+        msg = str(e)
+        if "CUDA" in msg or "memory" in msg.lower() or "cuda" in msg:
+            print(f"WORKER-ERROR {well}: {msg[:100]}",
+                  file=sys.stderr, flush=True)
+            raise
         return []
     if cal.depth_band is None or cal.rms_residual_ft > 2.0:
         return []
@@ -104,8 +124,11 @@ def harvest(pairs_dir: str = "data/pairs", workers: int = 1) -> None:
                 consume(harvest_well(well_dir))
         else:
             import multiprocessing as mp
+            n_gpus = int(os.environ.get("N_GPUS", "1"))
             ctx = mp.get_context("spawn")  # own OCR model per worker
-            with ctx.Pool(workers) as pool:
+            counter = ctx.Value("i", 0)
+            with ctx.Pool(workers, initializer=worker_init,
+                          initargs=(counter, n_gpus)) as pool:
                 for rows in pool.imap_unordered(harvest_well, todo):
                     consume(rows)
 

@@ -7,12 +7,22 @@
 set -euo pipefail
 
 WORKERS="${WORKERS:-8}"
+export N_GPUS="${N_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
+MIN_WELLS="${MIN_WELLS:-200}"
 
-echo "== harvest (workers=$WORKERS)"
+echo "== harvest (workers=$WORKERS, gpus=$N_GPUS)"
 python -m training.harvest_labels --workers "$WORKERS"
 
 echo "== crop count"
 ls data/label_crops/*.png | wc -l
+
+# guard: never retrain (and overwrite the model) on a failed harvest
+WELLS=$(tail -n +2 data/label_crops/manifest.csv | cut -d, -f3 | sort -u | wc -l)
+echo "== wells in manifest: $WELLS"
+if [ "$WELLS" -lt "$MIN_WELLS" ]; then
+    echo "harvest yielded only $WELLS wells (<$MIN_WELLS) - refusing to retrain"
+    exit 1
+fi
 
 echo "== retrain"
 python -m training.train_digits

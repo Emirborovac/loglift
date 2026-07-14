@@ -136,8 +136,12 @@ def run(pairs_dir: str = "data/pairs", out_csv: str = "data/benchmark.csv",
             print(f"{os.path.basename(wd)}: done", flush=True)
     else:
         import multiprocessing as mp
+        from training.harvest_labels import worker_init
+        n_gpus = int(os.environ.get("N_GPUS", "1"))
         ctx = mp.get_context("spawn")  # each worker gets its own OCR model
-        with ctx.Pool(workers) as pool:
+        counter = ctx.Value("i", 0)
+        with ctx.Pool(workers, initializer=worker_init,
+                      initargs=(counter, n_gpus)) as pool:
             for rows in pool.imap_unordered(bench_well, todo):
                 flush(rows)
                 if rows:
