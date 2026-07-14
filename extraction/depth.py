@@ -241,6 +241,10 @@ def calibrate_depth(path: str, layout: Layout) -> DepthCalibration:
         key = (n_distinct, -rms)
         if best is None or key > best[0]:
             best = (key, slope, intercept, inliers, points, (left, right))
+        # early accept: a strong fit on this band makes trying the remaining
+        # candidates pointless - and OCR per band dominates runtime
+        if n_distinct >= 5 and rms <= 1.0:
+            break
 
     if best is None:
         raise ValueError(last_err)
