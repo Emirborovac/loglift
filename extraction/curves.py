@@ -43,10 +43,14 @@ def _suppress_grid(dark: np.ndarray) -> np.ndarray:
     return out
 
 
-def trace_curve(band: np.ndarray, step: int = 2, jump_penalty: float = 0.08,
+def trace_curve(band: np.ndarray, step: int = 0, jump_penalty: float = 0.08,
                 max_jump: int = 120) -> np.ndarray:
     # max_jump must cover near-horizontal curve slews (a GR kick can move
-    # sideways >40 px per row); too small and the path can't follow them
+    # sideways >40 px per row); too small and the path can't follow them.
+    # step 0 = adaptive: giant strips sample every 4 rows (still 2x finer
+    # than the 0.5 ft output grid), normal strips every 2.
+    if step == 0:
+        step = 4 if band.shape[0] > 30000 else 2
     """Trace the dominant curve through a grayscale track band.
 
     Returns x position (float, band coordinates) per sampled row; rows are
