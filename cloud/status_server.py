@@ -20,6 +20,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 START = time.time()
 
 
+def newest_log() -> str:
+    logs = sorted(glob.glob(os.path.join(ROOT, "cycle*.log")) +
+                  glob.glob(os.path.join(ROOT, "train_*.log")) +
+                  glob.glob(os.path.join(ROOT, "benchmark*.log")),
+                  key=lambda p: os.path.getmtime(p))
+    return logs[-1] if logs else os.path.join(ROOT, "cycle1.log")
+
+
 def sh(cmd: str) -> str:
     try:
         return subprocess.run(cmd, shell=True, capture_output=True,
@@ -62,7 +70,7 @@ def crop_rate(crops: int) -> float:
 def stage() -> str:
     # read the WHOLE log for stage markers (they scroll out of any tail)
     try:
-        log = open(os.path.join(ROOT, "cycle1.log"), errors="replace").read()
+        log = open(newest_log(), errors="replace").read()
     except OSError:
         return "starting..."
     bench = os.path.join(ROOT, "data", "benchmark.csv")
@@ -173,7 +181,7 @@ class Handler(BaseHTTPRequestHandler):
             gpu1=html.escape(gpus[1] if len(gpus) > 1 else "?"),
             load=sh("cut -d' ' -f1 /proc/loadavg"),
             disk=sh(f"du -sh {ROOT}/data 2>/dev/null | cut -f1"),
-            log=html.escape(tail(os.path.join(ROOT, "cycle1.log"))),
+            log=html.escape(tail(newest_log())),
             train=html.escape(tail(os.path.join(ROOT, "data",
                                                 "overnight_train.log"), 12)
                               if os.path.exists(os.path.join(
