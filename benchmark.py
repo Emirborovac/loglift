@@ -35,10 +35,13 @@ warnings.filterwarnings("ignore")
 def best_las_match(trace: np.ndarray, scan_depths: np.ndarray,
                    las) -> tuple[str, float, float]:
     """(mnemonic, r, lag_ft) of the LAS curve best matching the trace."""
-    depths = np.asarray(las.index, dtype=float)
+    depths = pd.to_numeric(np.asarray(las.index), errors="coerce")
     best = ("", 0.0, 0.0)
     for curve in las.curves[1:]:
-        vals = np.asarray(las[curve.mnemonic], dtype=float)
+        # some LAS files carry non-standard off-scale markers ('********',
+        # '#####') instead of the declared NULL; coerce them to NaN
+        vals = pd.to_numeric(np.asarray(las[curve.mnemonic]),
+                             errors="coerce")
         ok = ~np.isnan(vals)
         if ok.sum() < 100:
             continue
@@ -59,6 +62,15 @@ COLUMNS = ["well", "stage", "error", "track", "curve", "trace_std",
 
 
 def bench_well(well_dir: str) -> list[dict]:
+    """Wrapper: no single well may ever crash the pool."""
+    try:
+        return _bench_well(well_dir)
+    except Exception as e:
+        return [dict(well=os.path.basename(well_dir), stage="crash",
+                     error=f"{type(e).__name__}: {str(e)[:60]}")]
+
+
+def _bench_well(well_dir: str) -> list[dict]:
     """Run the full pipeline on one well; returns result/error rows."""
     well = os.path.basename(well_dir)
     scans = glob.glob(os.path.join(well_dir, "scan_*"))
