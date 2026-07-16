@@ -115,6 +115,14 @@ def _run_job(job_id: str, scan_path: str, well: str, api: str):
         job.update(status="failed", message=f"{type(e).__name__}: {e}")
 
 
+def _start(scan_path: str, well: str, api: str) -> str:
+    job_id = uuid.uuid4().hex[:12]
+    JOBS[job_id] = dict(status="queued", message="queued")
+    threading.Thread(target=_run_job, args=(job_id, scan_path, well, api),
+                     daemon=True).start()
+    return job_id
+
+
 @app.post("/convert")
 async def convert(file: UploadFile = File(...), well: str = Form(""),
                   api: str = Form("")):
@@ -126,6 +134,20 @@ async def convert(file: UploadFile = File(...), well: str = Form(""),
     threading.Thread(target=_run_job, args=(job_id, scan_path, well, api),
                      daemon=True).start()
     return {"job_id": job_id}
+
+
+import glob as _glob
+
+SAMPLE_WELL = os.path.join(HERE, "..", "data", "pairs", "15001273970000")
+
+
+@app.post("/sample")
+def sample():
+    """Kick off a job on a bundled example scan (Kansas, calibrates cleanly)."""
+    scans = _glob.glob(os.path.join(SAMPLE_WELL, "scan_*"))
+    if not scans:
+        raise HTTPException(404, "sample scan not available in this install")
+    return {"job_id": _start(scans[0], "CAMPBELL 20 (sample)", "15-001-27397")}
 
 
 @app.get("/status/{job_id}")
