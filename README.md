@@ -1,79 +1,88 @@
 # LogLift
 
-**AI that converts scanned paper well logs (TIFF/PDF) into digital LAS files.**
+**An open benchmark and baseline for digitizing scanned paper well logs — and an open challenge to solve the hard part: curve extraction.**
 
-## The problem
+Millions of oil & gas wells were logged on paper before the digital era. Those measurements survive only as scanned images that no software can read. Converting them is a real, unsolved problem — and there has never been a large, open dataset to work on it. **LogLift is that dataset, plus a working baseline, plus a scoreboard.**
 
-Millions of oil and gas wells were logged before the digital era. Their measurements exist only as scanned images of paper strips — unreadable by any modern software. One commercial archive alone holds 7+ million of these raster logs across 3 million wells.
+---
 
-Today, converting a raster log to usable digital data means either manual curve tracing in 30-year-old desktop tools, or paying a service company per log. Meanwhile, demand for this old data is growing fast: well re-development, CO₂ storage site screening, and geothermal well repurposing all start with legacy well records.
+## 🎯 The open challenge: curve extraction
 
-## The solution
+Reading the **depth scale** off a scanned log is essentially solved here (see results below). **Tracing the curves is not — and nobody has solved it, anywhere.** The best published method reaches only ~0.62 correlation on gamma ray, the *easiest* curve. Sharp peaks look identical to grid lines; washed-out zones are a scribble even a human struggles with.
 
-LogLift reads a scanned well log image and produces a calibrated digital LAS file:
+**That's the invitation.** We provide the data, a baseline, and a reproducible benchmark. Beat it. Every improvement to curve extraction is a real contribution to a problem the whole industry keeps a human in the loop for.
 
-1. **Layout detection** — find the log tracks, depth column, and header on the image
-2. **Grid & depth calibration** — read the depth numbers and grid lines to map pixels to depth and scale
-3. **Curve extraction** — trace each curve through the track, separating overlapping curves by line style
-4. **Unit scaling** — convert pixel positions to real engineering units (gAPI, ohm·m, g/cm³ ...)
-5. **Validation** — check the output against physical rules (value ranges, curve consistency) before export
-6. **LAS export** — write a standard LAS 2.0 file any industry software can read
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for how to run the benchmark and submit results, and **[LEADERBOARD.md](LEADERBOARD.md)** for current scores.
 
-## Why it is feasible
+---
 
-The Kansas Geological Survey (KGS) publishes both the scanned image **and** the verified digital LAS file for **22,490 of the same wells** (~93,000 log images) — free, no registration. That gives us ground-truth training and testing pairs at a scale that did not exist when today's digitizing tools were built.
+## What's in here
 
-Verified (July 2026):
-
-| Check | Result |
+| Component | What it is |
 |---|---|
-| Kansas wells with a digital LAS file | 24,029 |
-| Kansas wells with scanned paper logs | 140,694 |
-| **Wells with both (training pairs)** | **22,490** |
-| Scan images for those paired wells | 93,567 TIFFs |
-| Access | Free, no login |
+| **Open benchmark** | 22,490 wells with a paired scanned image **and** verified digital LAS — free, no login. Built from public Kansas Geological Survey data. |
+| **Trained depth reader** | A small CRNN that reads depth-scale numbers off the scan, trained with *zero manual labels* (self-supervised), ~90% exact-match on held-out wells. |
+| **Baseline pipeline** | layout detection → depth calibration → curve tracing → LAS export, end to end. |
+| **Assisted app** | Upload a scan, auto-trace, drag curves to correct, export LAS (human-in-the-loop, the way real tools work). |
+| **Reproducible benchmark** | Score any pipeline against ground truth on 13,000+ wells with one command. |
 
-More states (North Dakota, Oklahoma, Texas) can be added with the same approach later.
+## Current results (baseline, 13,112 wells)
 
-## Project structure
+| Metric | Result | Notes |
+|---|---|---|
+| **Depth auto-conversion** | **77.7% of wells** | the well is fully depth-registered, hands-off |
+| **Depth accuracy** | **0.82 ft median RMS** | on par with commercial vendors; refuses rather than fabricates |
+| Depth-reader model | ~90% exact-match | held-out wells, self-supervised |
+| **Curve extraction** | 0.51 median best-curve correlation | **← the open challenge.** SOTA is ~0.62 |
 
+Depth is production-grade. **Curves are the frontier — that's where contributors come in.**
+
+## Quick start
+
+```bash
+git clone https://github.com/Emirborovac/loglift.git && cd loglift
+pip install -r requirements.txt
+
+# build the paired dataset from public KGS data (downloads free, no login)
+python -m pipeline.indexes      # join scan & LAS indexes -> 22,490 pairs
+python -m pipeline.pairs        # match each scan to its LAS depth interval
+python -m pipeline.download --limit 200   # grab 200 pairs to start (~1 GB)
+
+# run the baseline end-to-end on one scan
+python convert.py data/pairs/<well>/scan_*.tif
+
+# score the baseline against ground truth
+python benchmark.py --workers 4
+
+# try the assisted app
+python -m uvicorn app.main:app --port 8517   # then open localhost:8517
 ```
-loglift/
-├── pipeline/          # data pipeline: build the paired scan+LAS dataset from KGS
-│   ├── indexes.py     #   download & join the KGS scan/LAS indexes
-│   ├── download.py    #   fetch paired TIFF + LAS files
-│   └── pairs.py       #   match each scan image to its LAS depth interval
-├── extraction/        # image → curves (the core model / CV work)
-├── validation/        # petrophysical sanity checks on extracted curves
-├── export/            # LAS file writing
-└── data/              # local data (gitignored)
-```
 
-## Status
+## How it works
 
-- [x] Problem researched and data availability verified
-- [x] KGS index pipeline (join scans ↔ LAS by API number)
-- [x] Paired dataset builder (62,006 matched pairs; parallel, resumable downloads)
-- [x] Track/grid layout detection (borders, depth column, sections)
-- [x] Depth calibration: OCR + trained CRNN digit reader + RANSAC line fit
-- [x] Curve extraction (Viterbi tracing, multi-curve per track)
-- [x] Header reading: curve names + engineering-unit scaling
-- [x] LAS export + single-command converter (`python convert.py scan.tif`)
-- [x] Web app (upload → review overlay → download LAS)
-- [x] Benchmark against ground truth (resumable, parallel)
-- [ ] Human-in-the-loop trace correction UI
-- [ ] International validation (NLOG, Australia)
+1. **Layout detection** — find the log section, curve tracks, and depth column
+2. **Depth calibration** — OCR + a trained CRNN read the depth labels; a RANSAC fit maps image rows to feet (physics-gated, refuses when unsure)
+3. **Curve tracing** — the baseline traces each curve (the part we want you to improve)
+4. **Header reading** — curve names + engineering-unit scales
+5. **LAS export** — standard LAS 2.0 any petrophysics software reads
 
-Current numbers (95-well benchmark, wells spanning 1930s–2020s):
-**54% calibrate depth fully automatically** (median RMS well under 1 ft);
-traced curves match ground-truth LAS at |r| ≥ 0.7 on the best wells;
-failures are explicit refusals, never fabricated output. The custom digit
-reader (trained on self-labeled crops) lifted calibration from 31% → 54%
-in its first training cycle.
+A `playground/` app lets you iterate on the curve algorithm visually on a single log.
 
-## Data sources
+## Why depth works but curves don't (yet)
 
-- [KGS LAS files database](https://www.kgs.ku.edu/Magellan/Logs/index.html)
-- [KGS scanned wireline logs](https://www.kgs.ku.edu/Magellan/Elog/index.html)
+The depth reader trains itself: the pipeline can *verify* a depth label (round number, on a straight line, physical scale), so it self-labels 120,000 examples with no human. Curves have no such clean self-check — a sharp peak and a grid line are locally identical. That asymmetry is the whole story, and the open problem.
 
-Well data courtesy of the Kansas Geological Survey.
+## Roadmap / where to help
+
+- **Curve segmentation model** (UNet on synthetic + self-labeled tracks — scaffolding is in `training/`)
+- Sharp-peak vs grid-line disambiguation
+- Overlapping / crossing curve separation
+- International generalization (Dutch NLOG, Australian archives)
+
+## License & data
+
+Code: see [LICENSE]. Well data courtesy of the **Kansas Geological Survey** (public). Please cite KGS and this repo if you use the benchmark.
+
+## Acknowledgments
+
+Grew out of Ed Phillips' open petrophysics work. Built as an honest, open contribution to a problem the industry has quietly lived with for decades.

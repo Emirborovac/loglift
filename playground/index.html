@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LogLift — log paper</title>
+<style>
+ html,body{margin:0;height:100%;background:#0f1720;color:#dbe6ef;font:14px system-ui,sans-serif;}
+ header{display:flex;align-items:center;gap:14px;padding:8px 16px;background:#15242f;border-bottom:1px solid #223442;}
+ header .t{font-size:14px;} header .m{color:#8aa2b4;font-size:12.5px;}
+ .tools{margin-left:auto;display:flex;gap:6px;align-items:center;}
+ button{background:#22384a;color:#dbe6ef;border:1px solid #33546b;border-radius:6px;padding:5px 11px;cursor:pointer;font-size:14px;}
+ button:hover{background:#2b485e;}
+ .zoom{min-width:52px;text-align:center;color:#8aa2b4;font-size:12.5px;}
+ .stage{position:absolute;top:41px;left:0;right:0;bottom:0;overflow:auto;background:#0b1218;}
+ .stage img{display:block;image-rendering:pixelated;transform-origin:top left;}
+ .hint{color:#8aa2b4;font-size:12px;}
+</style>
+</head>
+<body>
+<header>
+  <span class="t">Log paper</span>
+  <span class="m" id="meta">…</span>
+  <span class="hint">scroll to pan · Ctrl/⌘+wheel to zoom at cursor</span>
+  <div class="tools">
+    <button id="curve">Detect 1st curve</button>
+    <button id="out">−</button>
+    <span class="zoom" id="z">100%</span>
+    <button id="in">+</button>
+    <button id="fit">Fit width</button>
+    <button id="full">100%</button>
+  </div>
+</header>
+<div class="stage" id="stage">
+  <div id="canvas" style="position:relative;">
+    <img id="log" src="/log.png">
+    <svg id="ov" style="position:absolute;top:0;left:0;pointer-events:none;"></svg>
+  </div>
+</div>
+<script>
+const stage=document.getElementById('stage'), img=document.getElementById('log');
+const ov=document.getElementById('ov');
+let nat={w:1,h:1}, scale=1, curvePts=null, leftX=0;
+function drawOverlay(){
+  if(!curvePts){ov.innerHTML='';return;}
+  ov.setAttribute('width',nat.w*scale); ov.setAttribute('height',nat.h*scale);
+  const S=v=>(v*scale).toFixed(1);
+  const line=curvePts.map(p=>`${S(p[0])},${S(p[1])}`).join(' ');
+  // filled region: down the left edge, up along the curve, closed
+  const top=curvePts[0][1], bot=curvePts[curvePts.length-1][1];
+  const poly=`${S(leftX)},${S(top)} `+line+` ${S(leftX)},${S(bot)}`;
+  ov.innerHTML=
+    `<polygon points="${poly}" fill="#2f9bff" fill-opacity="0.28" stroke="none"/>`+
+    `<polyline points="${line}" fill="none" stroke="#ff2020" stroke-width="2"/>`;
+}
+function apply(){img.style.width=(nat.w*scale)+'px';img.style.height=(nat.h*scale)+'px';
+  document.getElementById('z').textContent=Math.round(scale*100)+'%';drawOverlay();}
+function setScale(s,cx,cy){
+  const old=scale; scale=Math.max(0.05,Math.min(8,s));
+  // keep the point under the cursor stable
+  if(cx!==undefined){
+    const r=stage.getBoundingClientRect();
+    const px=(stage.scrollLeft+cx-r.left)/old, py=(stage.scrollTop+cy-r.top)/old;
+    apply();
+    stage.scrollLeft=px*scale-(cx-r.left); stage.scrollTop=py*scale-(cy-r.top);
+  } else apply();
+}
+fetch('/meta').then(r=>r.json()).then(m=>{
+  nat={w:m.w,h:m.h};
+  document.getElementById('meta').textContent=`${m.file} · ${m.w}×${m.h}px`;
+  fitWidth();
+});
+function fitWidth(){setScale((stage.clientWidth-20)/nat.w);}
+document.getElementById('in').onclick=()=>setScale(scale*1.25);
+document.getElementById('out').onclick=()=>setScale(scale/1.25);
+document.getElementById('fit').onclick=fitWidth;
+document.getElementById('full').onclick=()=>setScale(1);
+stage.addEventListener('wheel',e=>{
+  if(e.ctrlKey||e.metaKey){e.preventDefault();
+    setScale(scale*(e.deltaY<0?1.15:1/1.15), e.clientX, e.clientY);}
+},{passive:false});
+img.onload=()=>{if(nat.w>1)apply();};
+
+document.getElementById('curve').onclick=async()=>{
+  const btn=document.getElementById('curve'); btn.textContent='detecting…';
+  const r=await(await fetch('/curve1.json')).json();
+  curvePts=r.points; leftX=r.left_x; drawOverlay(); btn.textContent='1st curve ✓';
+};
+</script>
+</body>
+</html>
