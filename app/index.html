@@ -3,148 +3,187 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LogLift — paper well logs to LAS</title>
+<title>LogLift — assisted well-log digitizer</title>
 <style>
-  :root { --ink:#1b2733; --accent:#0b6e4f; --line:#d7dee6; --bg:#f5f7fa; }
-  * { box-sizing:border-box; }
-  body { margin:0; font:15px/1.5 system-ui,Segoe UI,sans-serif; color:var(--ink); background:var(--bg); }
-  header { background:#12222f; color:#fff; padding:18px 28px; }
-  header h1 { margin:0; font-size:20px; letter-spacing:.4px; }
-  header p { margin:2px 0 0; opacity:.75; font-size:13px; }
-  main { max-width:1060px; margin:28px auto; padding:0 20px; }
-  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:22px; margin-bottom:18px; }
-  .drop { border:2px dashed var(--line); border-radius:10px; padding:44px; text-align:center; cursor:pointer; transition:.15s; }
-  .drop.hover { border-color:var(--accent); background:#f0faf6; }
-  .drop input { display:none; }
-  .fields { display:flex; gap:12px; margin-top:14px; }
-  .fields input { flex:1; padding:9px 12px; border:1px solid var(--line); border-radius:7px; font-size:14px; }
-  button.go { margin-top:14px; background:var(--accent); color:#fff; border:0; border-radius:7px; padding:11px 26px; font-size:15px; cursor:pointer; }
-  button.go:disabled { opacity:.5; cursor:default; }
-  #status { font-weight:600; }
-  #status.err { color:#b3261e; }
-  .row { display:flex; gap:18px; align-items:flex-start; }
-  .overlay-wrap { flex:1; max-height:70vh; overflow:auto; border:1px solid var(--line); border-radius:8px; }
-  .overlay-wrap img { width:100%; display:block; }
-  .report { width:330px; flex:none; }
-  .report table { width:100%; border-collapse:collapse; font-size:14px; }
-  .report td { padding:6px 4px; border-bottom:1px solid var(--line); }
-  .report td:last-child { text-align:right; font-weight:600; }
-  .chip { display:inline-block; padding:2px 9px; border-radius:20px; font-size:12px; margin:2px; background:#e8f2ee; color:var(--accent); }
-  .chip.verify { background:#fdf1e2; color:#a35c00; }
-  a.dl { display:inline-block; margin-top:14px; background:var(--accent); color:#fff; text-decoration:none; padding:11px 24px; border-radius:7px; }
-  .hidden { display:none; }
-  .note { font-size:12.5px; color:#5a6b7a; margin-top:10px; }
+ :root{--ink:#16232e;--accent:#0b6e4f;--line:#d7dee6;--bg:#eef2f6;}
+ *{box-sizing:border-box;}
+ body{margin:0;font:14px/1.5 system-ui,Segoe UI,sans-serif;color:var(--ink);background:var(--bg);}
+ header{background:#12222f;color:#fff;padding:12px 22px;display:flex;justify-content:space-between;align-items:center;}
+ header h1{margin:0;font-size:17px;} header .sub{opacity:.7;font-size:12px;}
+ main{display:flex;height:calc(100vh - 46px);}
+ #left{flex:1;overflow:auto;background:#fff;border-right:1px solid var(--line);position:relative;}
+ #right{width:330px;padding:16px;overflow:auto;}
+ .card{background:#fff;border:1px solid var(--line);border-radius:9px;padding:14px;margin-bottom:14px;}
+ .drop{border:2px dashed var(--line);border-radius:9px;padding:34px;text-align:center;cursor:pointer;}
+ .drop.hover{border-color:var(--accent);background:#f0faf6;}
+ .drop input{display:none;}
+ button{background:var(--accent);color:#fff;border:0;border-radius:7px;padding:9px 16px;font-size:14px;cursor:pointer;}
+ button.sec{background:#5a6b7a;} button:disabled{opacity:.5;cursor:default;}
+ input.f{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:6px;margin:3px 0;}
+ .curverow{border:1px solid var(--line);border-radius:8px;padding:8px;margin-bottom:8px;}
+ .curverow.active{border-color:var(--accent);box-shadow:0 0 0 2px #0b6e4f22;}
+ .curverow .top{display:flex;align-items:center;gap:6px;}
+ .swatch{width:14px;height:14px;border-radius:3px;flex:none;}
+ .curverow .sc{display:flex;gap:6px;margin-top:5px;}
+ .curverow .sc input{width:50%;}
+ .hint{font-size:12px;color:#5a6b7a;}
+ svg{display:block;} .ctrl{cursor:grab;} .ctrl:active{cursor:grabbing;}
+ .hidden{display:none;}
+ #status{font-weight:600;margin-bottom:8px;}
+ .depthlbl{position:absolute;left:2px;font-size:10px;color:#c0392b;background:#fff8;padding:0 2px;}
 </style>
 </head>
 <body>
 <header>
-  <h1>LogLift</h1>
-  <p>Scanned paper well log in — LAS file out</p>
+  <div><h1>LogLift</h1><div class="sub">assisted digitizer — auto-trace, then drag to match</div></div>
+  <div id="hdrinfo" class="sub"></div>
 </header>
 <main>
-  <div class="card" id="upload-card">
-    <div class="drop" id="drop">
-      <input type="file" id="file" accept=".tif,.tiff,.png,.jpg,.jpeg">
-      <strong>Drop a scanned log here</strong> or click to choose a file
-      <div class="note">TIFF straight from a state archive works best (300 DPI)</div>
-    </div>
-    <div class="fields">
-      <input id="well" placeholder="Well name (optional)">
-      <input id="api" placeholder="API number (optional)">
-    </div>
-    <button class="go" id="go" disabled>Convert to LAS</button>
-  </div>
-
-  <div class="card hidden" id="progress-card">
-    <div id="status">…</div>
-    <div class="note">Layout detection → depth OCR → header reading → curve tracing → LAS export</div>
-  </div>
-
-  <div class="card hidden" id="result-card">
-    <div class="row">
-      <div class="overlay-wrap"><img id="overlay" alt="traced curves overlay"></div>
-      <div class="report">
-        <h3 style="margin-top:0">Conversion report</h3>
-        <table id="report-table"></table>
-        <div id="curve-chips" style="margin-top:10px"></div>
-        <a class="dl" id="dl" href="#">Download LAS</a>
-        <div class="note">Colored lines show what was traced. Curves marked
-        “verify” were paired to header names heuristically — check them
-        against the overlay before use.</div>
+  <div id="left">
+    <div id="uploadWrap" style="padding:40px;max-width:520px;margin:0 auto;">
+      <div class="card">
+        <div class="drop" id="drop">
+          <input type="file" id="file" accept=".tif,.tiff,.png,.jpg,.jpeg">
+          <strong>Drop a scanned log</strong> or click to choose
+          <div class="hint" style="margin-top:6px;">TIFF from a state archive works best</div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:10px;">
+          <input class="f" id="well" placeholder="Well name (optional)">
+          <input class="f" id="api" placeholder="API (optional)">
+        </div>
+        <button id="go" style="margin-top:10px;" disabled>Auto-trace</button>
       </div>
+    </div>
+    <div id="editor" class="hidden"></div>
+  </div>
+  <div id="right">
+    <div class="card" id="progress"><div id="status">…</div>
+      <div class="hint">layout → depth OCR → header → tracing</div></div>
+    <div class="card hidden" id="panel">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <strong>Curves</strong>
+        <span class="hint" id="depthinfo"></span>
+      </div>
+      <div id="curves"></div>
+      <button class="sec" id="addcurve" style="width:100%;margin-top:6px;">+ add curve</button>
+      <button id="export" style="width:100%;margin-top:10px;">Export corrected LAS</button>
+      <div class="hint" style="margin-top:8px;">Drag the dots to match the scan. Set each curve's name and its left/right scale values, then export.</div>
     </div>
   </div>
 </main>
 <script>
-const drop = document.getElementById('drop');
-const fileInput = document.getElementById('file');
-const go = document.getElementById('go');
-let file = null;
+const $=s=>document.querySelector(s);
+let DATA=null, JOB=null, active=0;
 
-drop.onclick = () => fileInput.click();
-drop.ondragover = e => { e.preventDefault(); drop.classList.add('hover'); };
-drop.ondragleave = () => drop.classList.remove('hover');
-drop.ondrop = e => {
-  e.preventDefault(); drop.classList.remove('hover');
-  if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
-};
-fileInput.onchange = () => { if (fileInput.files.length) setFile(fileInput.files[0]); };
+// ---------- upload ----------
+const drop=$('#drop'), fileInput=$('#file'); let file=null;
+drop.onclick=()=>fileInput.click();
+drop.ondragover=e=>{e.preventDefault();drop.classList.add('hover');};
+drop.ondragleave=()=>drop.classList.remove('hover');
+drop.ondrop=e=>{e.preventDefault();drop.classList.remove('hover');if(e.dataTransfer.files[0])setFile(e.dataTransfer.files[0]);};
+fileInput.onchange=()=>{if(fileInput.files[0])setFile(fileInput.files[0]);};
+function setFile(f){file=f;drop.querySelector('strong').textContent=f.name;$('#go').disabled=false;}
 
-function setFile(f) {
-  file = f;
-  drop.querySelector('strong').textContent = f.name;
-  go.disabled = false;
-}
-
-go.onclick = async () => {
-  go.disabled = true;
-  document.getElementById('progress-card').classList.remove('hidden');
-  document.getElementById('result-card').classList.add('hidden');
-  const st = document.getElementById('status');
-  st.classList.remove('err');
-  st.textContent = 'uploading…';
-
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('well', document.getElementById('well').value);
-  fd.append('api', document.getElementById('api').value);
-  const res = await fetch('/convert', { method:'POST', body: fd });
-  const { job_id } = await res.json();
-
-  const poll = setInterval(async () => {
-    const s = await (await fetch('/status/' + job_id)).json();
-    st.textContent = s.message;
-    if (s.status === 'failed') {
-      clearInterval(poll); st.classList.add('err');
-      st.textContent = 'Could not convert this scan: ' + s.message;
-      go.disabled = false;
-    }
-    if (s.status === 'done') {
-      clearInterval(poll);
-      document.getElementById('progress-card').classList.add('hidden');
-      showResult(job_id, s.report);
-      go.disabled = false;
-    }
-  }, 800);
+$('#go').onclick=async()=>{
+  $('#go').disabled=true;
+  const fd=new FormData();fd.append('file',file);
+  fd.append('well',$('#well').value);fd.append('api',$('#api').value);
+  const {job_id}=await(await fetch('/convert',{method:'POST',body:fd})).json();
+  JOB=job_id;
+  const poll=setInterval(async()=>{
+    const s=await(await fetch('/status/'+JOB)).json();
+    $('#status').textContent=s.message;
+    if(s.status==='failed'){clearInterval(poll);$('#status').textContent='Could not process: '+s.message;$('#go').disabled=false;}
+    if(s.status==='done'){clearInterval(poll);loadEditor();}
+  },700);
 };
 
-function showResult(job_id, r) {
-  document.getElementById('overlay').src = '/result/' + job_id + '/overlay';
-  document.getElementById('dl').href = '/result/' + job_id + '/las';
-  const rows = [
-    ['Depth interval', r.depth_top_ft + ' – ' + r.depth_bottom_ft + ' ft'],
-    ['Depth labels read', r.depth_labels_used],
-    ['Depth accuracy (RMS)', r.depth_rms_ft + ' ft'],
-    ['Tracks detected', r.tracks],
-    ['Curves extracted', r.curves.length],
-  ];
-  document.getElementById('report-table').innerHTML =
-    rows.map(([k,v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
-  document.getElementById('curve-chips').innerHTML =
-    r.curves.map(c => `<span class="chip ${c.verify ? 'verify':''}">
-      ${c.name} [${c.unit}]${c.verify ? ' — verify':''}</span>`).join('');
-  document.getElementById('result-card').classList.remove('hidden');
+// ---------- editor ----------
+async function loadEditor(){
+  DATA=await(await fetch('/result/'+JOB+'/data.json')).json();
+  $('#uploadWrap').classList.add('hidden');
+  $('#progress').classList.add('hidden');
+  $('#panel').classList.remove('hidden');
+  $('#editor').classList.remove('hidden');
+  $('#depthinfo').textContent=`${DATA.depth.top.toFixed(0)}–${DATA.depth.bottom.toFixed(0)} ft · RMS ${DATA.depth.rms} ft`;
+  $('#hdrinfo').textContent=`${DATA.curves.length} curves detected · drag to correct`;
+  renderSVG(); renderPanel();
 }
+
+function renderSVG(){
+  const W=DATA.display_w,H=DATA.display_h;
+  let s=`<svg id="svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`;
+  s+=`<image href="/result/${JOB}/scan.png" x="0" y="0" width="${W}" height="${H}"/>`;
+  DATA.curves.forEach((c,ci)=>{
+    const pts=c.points.map(p=>p.join(',')).join(' ');
+    const op=ci===active?1:0.5, wdt=ci===active?2.5:1.5;
+    s+=`<polyline points="${pts}" fill="none" stroke="${c.color}" stroke-width="${wdt}" opacity="${op}"/>`;
+    if(ci===active){
+      c.points.forEach((p,pi)=>{
+        s+=`<circle class="ctrl" data-c="${ci}" data-p="${pi}" cx="${p[0]}" cy="${p[1]}" r="4" fill="#fff" stroke="${c.color}" stroke-width="2"/>`;
+      });
+    }
+  });
+  s+=`</svg>`;
+  $('#editor').innerHTML=s;
+  attachDrag();
+}
+
+function attachDrag(){
+  const svg=$('#svg'); let cur=null;
+  svg.addEventListener('pointerdown',e=>{
+    if(e.target.classList.contains('ctrl')){cur=e.target;cur.setPointerCapture(e.pointerId);}
+  });
+  svg.addEventListener('pointermove',e=>{
+    if(!cur)return;
+    const r=svg.getBoundingClientRect();
+    const x=Math.max(0,Math.min(DATA.display_w,e.clientX-r.left));
+    const ci=+cur.dataset.c, pi=+cur.dataset.p;
+    DATA.curves[ci].points[pi][0]=Math.round(x*10)/10;   // only horizontal moves
+    cur.setAttribute('cx',x);
+    // live-update the polyline
+    const poly=svg.querySelectorAll('polyline')[ci];
+    poly.setAttribute('points',DATA.curves[ci].points.map(p=>p.join(',')).join(' '));
+  });
+  svg.addEventListener('pointerup',()=>{cur=null;});
+}
+
+function renderPanel(){
+  const box=$('#curves');box.innerHTML='';
+  DATA.curves.forEach((c,ci)=>{
+    const d=document.createElement('div');
+    d.className='curverow'+(ci===active?' active':'');
+    d.innerHTML=`<div class="top">
+       <span class="swatch" style="background:${c.color}"></span>
+       <input class="f nm" value="${c.name}" style="margin:0">
+       <button class="sec del" style="padding:4px 8px">✕</button></div>
+       <div class="sc"><input class="f lv" value="${c.left_value}" title="left-edge value">
+       <input class="f rv" value="${c.right_value}" title="right-edge value"></div>
+       <div class="hint">${c.unit||'units?'} — left → right scale</div>`;
+    d.onclick=e=>{if(e.target.tagName!=='INPUT'&&!e.target.classList.contains('del')){active=ci;renderSVG();renderPanel();}};
+    d.querySelector('.nm').onchange=e=>c.name=e.target.value;
+    d.querySelector('.lv').onchange=e=>c.left_value=parseFloat(e.target.value);
+    d.querySelector('.rv').onchange=e=>c.right_value=parseFloat(e.target.value);
+    d.querySelector('.del').onclick=()=>{DATA.curves.splice(ci,1);active=0;renderSVG();renderPanel();};
+    box.appendChild(d);
+  });
+}
+
+$('#addcurve').onclick=()=>{
+  const mid=DATA.display_w/2, H=DATA.display_h;
+  const pts=[];for(let i=0;i<20;i++)pts.push([mid,Math.round(H*i/19)]);
+  DATA.curves.push({id:Date.now()%100000,name:'NEW',unit:'',left_value:0,right_value:100,
+    color:['#e63030','#1f7be6','#1ea832','#d67800','#8e44ad'][DATA.curves.length%5],
+    track:0,points:pts});
+  active=DATA.curves.length-1;renderSVG();renderPanel();
+};
+
+$('#export').onclick=async()=>{
+  const res=await fetch('/export/'+JOB,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({curves:DATA.curves,step_ft:0.5})});
+  const blob=await res.blob();const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);a.download='loglift.las';a.click();
+};
 </script>
 </body>
 </html>

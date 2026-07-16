@@ -1,4 +1,8 @@
-"""LogLift web app: upload a scanned well log, get a LAS file back.
+"""LogLift assisted digitizer — upload a scan, auto-extract, correct by hand.
+
+The honest, industry-standard workflow: the app auto-traces to give a head
+start; the user drags the curves to match the scan exactly, sets curve
+names/scales, and exports a clean LAS.
 
 Run:
     uvicorn app.main:app --port 8517
@@ -6,7 +10,7 @@ Run:
 
 from __future__ import annotations
 
-import io
+import json
 import os
 import threading
 import traceback
@@ -14,166 +18,197 @@ import uuid
 import warnings
 
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from extraction.layout import detect_layout, load_gray, reanchor_tracks
 from extraction.depth import calibrate_depth
 from extraction.curves import extract_track_curves
 from extraction.header import read_header
-from convert import _assign_curves
-from export.las_writer import write_las
 
 warnings.filterwarnings("ignore")
+Image.MAX_IMAGE_PIXELS = None
 
 app = FastAPI(title="LogLift")
-
-JOBS_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "jobs")
+HERE = os.path.dirname(__file__)
+JOBS_DIR = os.path.join(HERE, "..", "data", "jobs")
 os.makedirs(JOBS_DIR, exist_ok=True)
+JOBS: dict[str, dict] = {}
 
-JOBS: dict[str, dict] = {}  # job_id -> {status, message, ...}
+DISPLAY_W = 620            # scan display width in px
+N_CTRL = 60               # control points per curve
+CURVE_COLORS = ["#e63030", "#1f7be6", "#1ea832", "#d67800",
+                "#8e44ad", "#00998e"]
 
 
-def _overlay_png(gray, layout, track_curves, out_path, width=900):
-    """Traced curves drawn over the (downsampled) scan for visual review."""
-    im = Image.fromarray(gray).convert("RGB")
-    scale = width / im.width
-    im = im.resize((width, int(im.height * scale)))
-    d = ImageDraw.Draw(im)
-    colors = [(230, 40, 40), (30, 110, 230), (30, 160, 60), (200, 120, 20)]
-
-    for t_idx, curves in track_curves.items():
-        left, right = layout.tracks[t_idx]
-        span = (right - left - 12) * scale
-        x0 = (left + 6) * scale
-        for c_idx, spec in enumerate(curves):
-            vals = spec["values"] if isinstance(spec, dict) else spec
-            norm = spec.get("norm") if isinstance(spec, dict) else None
-            arr = np.asarray(norm if norm is not None else vals, dtype=float)
-            if arr.max() > 1.5:  # scaled curve: re-normalize for drawing
-                lo, hi = np.nanmin(arr), np.nanmax(arr)
-                arr = (arr - lo) / max(1e-9, hi - lo)
-            color = colors[(t_idx * 2 + c_idx) % len(colors)]
-            step = max(1, int(2 / scale))
-            pts = []
-            for row in range(0, len(arr), step):
-                y = (layout.log_top + row) * scale
-                pts.append((x0 + float(arr[row]) * span, y))
-            if len(pts) > 1:
-                d.line(pts, fill=color, width=2)
-    im.save(out_path)
+def _decimate(norm: np.ndarray, n: int) -> list[int]:
+    """Indices of n evenly spaced control points."""
+    return list(np.linspace(0, len(norm) - 1, n).astype(int))
 
 
 def _run_job(job_id: str, scan_path: str, well: str, api: str):
     job = JOBS[job_id]
     try:
-        job.update(status="running", message="detecting layout...")
+        job.update(status="running", message="detecting layout…")
         layout = detect_layout(scan_path)
         if not layout.tracks and not layout.depth_col_candidates:
             raise ValueError("could not detect a log layout on this image")
 
-        job["message"] = "calibrating depth (OCR)..."
+        job["message"] = "calibrating depth (OCR)…"
         cal = calibrate_depth(scan_path, layout)
         layout = reanchor_tracks(layout, cal.depth_band)
 
-        job["message"] = "reading header..."
+        job["message"] = "reading header…"
         try:
             scales = read_header(scan_path, layout)
         except Exception:
             scales = []
 
-        job["message"] = "tracing curves..."
+        job["message"] = "tracing curves…"
         gray = load_gray(scan_path)
-        track_curves = {}
+        H0, W0 = gray.shape
+        scale = DISPLAY_W / W0
+        disp_h = int(H0 * scale)
+
+        # downsampled scan for the editor background
+        disp = Image.fromarray(gray).resize((DISPLAY_W, disp_h))
+        disp.convert("L").save(os.path.join(JOBS_DIR, f"{job_id}_scan.png"))
+
+        curves = []
+        ci = 0
         for t_idx, track in enumerate(layout.tracks):
-            traces = extract_track_curves(
-                gray, track, layout.log_top, layout.log_bottom, n_curves=2)
-            t_scales = [s for s in scales if s.track == t_idx]
-            specs = _assign_curves(traces, t_scales)
-            # keep the normalized trace for overlay drawing
-            for spec, tr in zip(specs, traces):
-                if isinstance(spec, dict):
-                    spec["norm"] = tr
-            track_curves[t_idx] = specs
+            traces = extract_track_curves(gray, track, layout.log_top,
+                                          layout.log_bottom, n_curves=2)
+            tscales = [s for s in scales if s.track == t_idx]
+            for k, tr in enumerate(traces):
+                left, right = track
+                rows = np.arange(layout.log_top, layout.log_bottom)
+                idx = _decimate(tr, N_CTRL)
+                pts = [[round((left + 6 + tr[i] * (right - left - 12)) * scale, 1),
+                        round((layout.log_top + i) * scale, 1)] for i in idx]
+                sc = tscales[k] if k < len(tscales) else None
+                curves.append(dict(
+                    id=ci, name=(sc.mnemonic if sc else f"CURVE{ci+1}"),
+                    unit=(sc.unit if sc else ""),
+                    left_value=(sc.left_value if sc and sc.left_value is not None else 0.0),
+                    right_value=(sc.right_value if sc and sc.right_value is not None else 100.0),
+                    color=CURVE_COLORS[ci % len(CURVE_COLORS)],
+                    track=t_idx, points=pts))
+                ci += 1
 
-        job["message"] = "writing LAS..."
-        las_path = os.path.join(JOBS_DIR, f"{job_id}.las")
-        write_las(las_path, layout, cal,
-                  {t: [({k: v for k, v in s.items() if k != "norm"}
-                        if isinstance(s, dict) else s) for s in specs_]
-                   for t, specs_ in track_curves.items()},
-                  well_name=well, api=api,
-                  source_scan=os.path.basename(scan_path))
-
-        overlay_path = os.path.join(JOBS_DIR, f"{job_id}.png")
-        _overlay_png(gray, layout, track_curves, overlay_path)
-
-        d0 = cal.depth_at(layout.log_top)
-        d1 = cal.depth_at(layout.log_bottom)
-        curves_out = []
-        for t_idx, specs_ in track_curves.items():
-            for s in specs_:
-                if isinstance(s, dict):
-                    curves_out.append(dict(
-                        name=s["name"], unit=s["unit"],
-                        scaled=s["unit"] != "norm",
-                        verify="?" in s["name"]))
-        job.update(
-            status="done", message="complete",
-            report=dict(
-                depth_top_ft=round(d0, 1), depth_bottom_ft=round(d1, 1),
-                depth_labels_used=cal.n_inliers,
-                depth_rms_ft=round(cal.rms_residual_ft, 2),
-                tracks=len(layout.tracks),
-                curves=curves_out,
-            ))
+        data = dict(
+            display_w=DISPLAY_W, display_h=disp_h, scale=scale,
+            depth=dict(slope=cal.slope, intercept=cal.intercept,
+                       top=cal.depth_at(layout.log_top),
+                       bottom=cal.depth_at(layout.log_bottom),
+                       rms=round(cal.rms_residual_ft, 2)),
+            tracks=[[round(l * scale, 1), round(r * scale, 1)]
+                    for l, r in layout.tracks],
+            log_top=layout.log_top, log_bottom=layout.log_bottom,
+            well=well, api=api, curves=curves)
+        with open(os.path.join(JOBS_DIR, f"{job_id}_data.json"), "w") as f:
+            json.dump(data, f)
+        job.update(status="done", message="ready to review")
     except Exception as e:
         traceback.print_exc()
-        job.update(status="failed",
-                   message=f"{type(e).__name__}: {e}")
+        job.update(status="failed", message=f"{type(e).__name__}: {e}")
 
 
 @app.post("/convert")
-async def convert_endpoint(file: UploadFile = File(...),
-                           well: str = Form(""), api: str = Form("")):
+async def convert(file: UploadFile = File(...), well: str = Form(""),
+                  api: str = Form("")):
     job_id = uuid.uuid4().hex[:12]
     scan_path = os.path.join(JOBS_DIR, f"{job_id}_{file.filename}")
     with open(scan_path, "wb") as f:
         f.write(await file.read())
     JOBS[job_id] = dict(status="queued", message="queued")
-    threading.Thread(target=_run_job,
-                     args=(job_id, scan_path, well, api), daemon=True).start()
+    threading.Thread(target=_run_job, args=(job_id, scan_path, well, api),
+                     daemon=True).start()
     return {"job_id": job_id}
 
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
     job = JOBS.get(job_id)
-    if job is None:
+    if not job:
         raise HTTPException(404, "unknown job")
     return JSONResponse(job)
 
 
-@app.get("/result/{job_id}/las")
-def result_las(job_id: str):
-    path = os.path.join(JOBS_DIR, f"{job_id}.las")
-    if not os.path.exists(path):
-        raise HTTPException(404, "no LAS for this job")
-    return FileResponse(path, filename=f"loglift_{job_id}.las",
+@app.get("/result/{job_id}/scan.png")
+def scan_png(job_id: str):
+    p = os.path.join(JOBS_DIR, f"{job_id}_scan.png")
+    if not os.path.exists(p):
+        raise HTTPException(404)
+    return FileResponse(p, media_type="image/png")
+
+
+@app.get("/result/{job_id}/data.json")
+def data_json(job_id: str):
+    p = os.path.join(JOBS_DIR, f"{job_id}_data.json")
+    if not os.path.exists(p):
+        raise HTTPException(404)
+    return FileResponse(p, media_type="application/json")
+
+
+@app.post("/export/{job_id}")
+def export(job_id: str, payload: dict = Body(...)):
+    """Receive corrected curves (display coords) and write a LAS file."""
+    import lasio
+    p = os.path.join(JOBS_DIR, f"{job_id}_data.json")
+    if not os.path.exists(p):
+        raise HTTPException(404)
+    meta = json.load(open(p))
+    scale = meta["scale"]
+    slope, intercept = meta["depth"]["slope"], meta["depth"]["intercept"]
+    tracks = meta["tracks"]
+    step = float(payload.get("step_ft", 0.5))
+
+    curves = payload["curves"]
+    # depth grid from the log extent
+    d0, d1 = sorted([meta["depth"]["top"], meta["depth"]["bottom"]])
+    d0 = np.ceil(d0 / step) * step
+    d1 = np.floor(d1 / step) * step
+    grid = np.arange(d0, d1 + step / 2, step)
+
+    las = lasio.LASFile()
+    las.well["WELL"] = lasio.HeaderItem("WELL", value=meta.get("well", ""))
+    las.well["API"] = lasio.HeaderItem("API", value=meta.get("api", ""))
+    las.well["STRT"] = lasio.HeaderItem("STRT", unit="FT", value=float(grid[0]))
+    las.well["STOP"] = lasio.HeaderItem("STOP", unit="FT", value=float(grid[-1]))
+    las.well["STEP"] = lasio.HeaderItem("STEP", unit="FT", value=step)
+    las.well["NULL"] = lasio.HeaderItem("NULL", value=-999.25)
+    las.other = "Digitized with LogLift (assisted, human-corrected)."
+    las.append_curve("DEPT", grid, unit="FT")
+
+    for c in curves:
+        pts = sorted(c["points"], key=lambda p: p[1])  # by display y
+        if len(pts) < 2:
+            continue
+        ys = np.array([p[1] for p in pts]) / scale         # orig rows
+        xs = np.array([p[0] for p in pts]) / scale         # orig x px
+        depth = slope * ys + intercept
+        tl, tr = tracks[c["track"]]
+        tl, tr = tl / scale, tr / scale
+        norm = (xs - (tl + 6)) / max(1.0, (tr - tl - 12))   # 0..1 in track
+        lv, rv = float(c["left_value"]), float(c["right_value"])
+        val = lv + norm * (rv - lv)
+        order = np.argsort(depth)  # np.interp needs ascending x
+        resampled = np.interp(grid, depth[order], val[order],
+                              left=np.nan, right=np.nan)
+        name = "".join(ch for ch in c["name"].upper()
+                       if ch.isalnum() or ch in "_")[:8] or f"C{c['id']}"
+        las.append_curve(name, resampled, unit=c.get("unit", ""))
+
+    out = os.path.join(JOBS_DIR, f"{job_id}_corrected.las")
+    with open(out, "w") as f:
+        las.write(f, version=2.0)
+    return FileResponse(out, filename=f"loglift_{job_id}.las",
                         media_type="text/plain")
-
-
-@app.get("/result/{job_id}/overlay")
-def result_overlay(job_id: str):
-    path = os.path.join(JOBS_DIR, f"{job_id}.png")
-    if not os.path.exists(path):
-        raise HTTPException(404, "no overlay for this job")
-    return FileResponse(path, media_type="image/png")
 
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    with open(os.path.join(os.path.dirname(__file__), "index.html"),
-              encoding="utf-8") as f:
+    with open(os.path.join(HERE, "index.html"), encoding="utf-8") as f:
         return f.read()
