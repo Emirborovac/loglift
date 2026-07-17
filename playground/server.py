@@ -1,7 +1,10 @@
-"""Playground server (port 3000). For now: just show the whole log.
+"""Playground server (port 3000): a single-log sandbox for iterating on the
+curve-extraction algorithm and seeing the result live on a real track.
 
-We iterate from here under your guidance, step by step.
-    python -m playground.server
+Requires at least one downloaded well (see the repo README quick-start):
+    python -m pipeline.download --limit 50
+Then:
+    python -m playground.server        # open http://localhost:3000
 """
 
 from __future__ import annotations
@@ -24,9 +27,17 @@ Image.MAX_IMAGE_PIXELS = None
 HERE = os.path.dirname(__file__)
 app = FastAPI()
 
-# the one log we are working on
-WELL = os.path.join(HERE, "..", "data", "pairs", "15001273970000")
-SCAN = glob.glob(os.path.join(WELL, "scan_*"))[0]
+# the log to work on: a specific well if present, else the first available.
+# Lazy so the module imports even before any data is downloaded.
+_PAIRS = os.path.join(HERE, "..", "data", "pairs")
+
+
+def _scan_path() -> str | None:
+    prefer = os.path.join(_PAIRS, "15001273970000")
+    hits = glob.glob(os.path.join(prefer, "scan_*"))
+    if not hits:
+        hits = glob.glob(os.path.join(_PAIRS, "*", "scan_*"))
+    return hits[0] if hits else None
 
 
 def leftmost_curve(thr: int = 115, vthick: int = 4, tol: float = 9.0):
@@ -37,8 +48,11 @@ def leftmost_curve(thr: int = 115, vthick: int = 4, tol: float = 9.0):
     but slightly under-reads very sharp rightward peaks (a known TODO we
     tackle separately).
     """
-    lay = detect_layout(SCAN)
-    gray = load_gray(SCAN)
+    scan = _scan_path()
+    if scan is None:
+        return {"points": [], "left_x": 0.0}
+    lay = detect_layout(scan)
+    gray = load_gray(scan)
     l, r = lay.tracks[0]
     top, bot = lay.log_top, lay.log_bottom
     band = gray[top:bot, l:r]
@@ -81,7 +95,10 @@ def curve1(thr: int = 115, vthick: int = 4, tol: float = 9.0):
 @app.get("/log.png")
 def log_png():
     # full native resolution so zooming reveals real detail
-    im = Image.open(SCAN).convert("L")
+    scan = _scan_path()
+    if scan is None:
+        return Response(b"", media_type="image/png")
+    im = Image.open(scan).convert("L")
     buf = io.BytesIO()
     im.save(buf, "PNG")
     return Response(buf.getvalue(), media_type="image/png")
@@ -89,9 +106,12 @@ def log_png():
 
 @app.get("/meta")
 def meta():
-    im = Image.open(SCAN)
+    scan = _scan_path()
+    if scan is None:
+        return {"w": 0, "h": 0, "file": "no data - run pipeline.download first"}
+    im = Image.open(scan)
     return {"w": im.width, "h": im.height,
-            "file": os.path.basename(SCAN)}
+            "file": os.path.basename(scan)}
 
 
 @app.get("/", response_class=HTMLResponse)
